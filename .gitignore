@@ -1,0 +1,7 @@
+# Big binaries and downloads - not source, 14 GB, re-downloadable
+models/
+llama.cpp/
+_tmp/
+
+# Editor / runtime leftovers
+*.bak

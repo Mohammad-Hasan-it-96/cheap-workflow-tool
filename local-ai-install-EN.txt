@@ -1,0 +1,656 @@
+================================================================================
+  LOCAL AI CODING AGENT - INSTALL & TUNING GUIDE
+  Target machine: Dell Precision 5550
+  Written: 2026-09-06
+================================================================================
+
+This file is English / LTR on purpose. Every command is copy-paste ready.
+Run everything in PowerShell (Windows PowerShell 5.1) unless stated otherwise.
+
+
+================================================================================
+0. VERIFIED MACHINE SPEC  (probed on this machine, not assumed)
+================================================================================
+
+  CPU        Intel Core i7-10750H  -  6 physical cores / 12 threads
+             (NOTE: this is a 10750H, not a 10800H. Thread count matters
+              for the -t flag. Use -t 6.)
+
+  RAM        31.8 GB  =  2 x 16 GB DDR4-3200, dual channel
+             Theoretical bandwidth ~51 GB/s, real ~40-45 GB/s.
+             This is the single biggest limit on tokens/sec.
+
+  GPU        NVIDIA Quadro T2000 with Max-Q Design
+             4096 MiB VRAM, driver 581.95
+             Turing, compute capability 7.5
+
+  Disk       C: 276 GB free   |   D: 201 GB free
+             Plenty. We will install to D:\ai
+
+  Already installed:  Node v26.7.0, npm 11.19.0, Git 2.55, Python 3.14.7,
+                      Ollama 0.32.13 (installed, not running)
+  Missing:            llama.cpp, hf CLI, opencode
+
+
+REALISTIC EXPECTATION - read this before you start
+--------------------------------------------------
+With 4 GB of VRAM the GPU cannot hold the model. It will only hold attention
+weights and the KV cache. The expert weights live in system RAM and are read
+by the CPU. Therefore:
+
+  - Expected generation speed: 8 - 13 tokens/sec
+  - Expected prompt processing (prefill): slow, this is the known weak spot
+    for MoE models on CPU. A 20k-token prompt can take 60-120 seconds.
+  - GPU speedup over pure CPU: roughly 1.2x - 1.5x. Useful, not dramatic.
+
+8-13 tok/s is fine for an overnight batch runner. It is not fine for
+interactive chat. Plan accordingly.
+
+
+================================================================================
+1. CREATE THE FOLDER LAYOUT
+================================================================================
+
+Run:
+
+    New-Item -ItemType Directory -Force -Path D:\ai\llama.cpp, D:\ai\models, D:\ai\bin, D:\ai\_tmp
+
+Final layout:
+
+    D:\ai\
+      llama.cpp\      <- binaries (llama-server.exe, llama-cli.exe, DLLs)
+      models\         <- .gguf model files
+      bin\            <- your .ps1 helper scripts
+      _tmp\           <- downloaded zips, safe to delete later
+
+
+================================================================================
+2. INSTALL llama.cpp  (CUDA build for Windows)
+================================================================================
+
+WHY NOT JUST OLLAMA?
+Ollama does not expose --n-cpu-moe. That flag is the entire reason this setup
+works on a 4 GB GPU: it keeps the MoE expert tensors on the CPU while leaving
+attention, the router, and the KV cache on the GPU. Without it you either do
+not fit in VRAM at all, or you fit and get no benefit.
+
+WHICH CUDA VERSION?
+Your driver (581.95) supports both CUDA 12.4 and 13.3 builds. Use the
+12.4 build. It is the lower-risk choice for a Turing-generation Quadro and
+has a smaller runtime download.
+
+You need TWO zips:
+  llama-b<NNNNN>-bin-win-cuda-12.4-x64.zip   <- the binaries
+  cudart-llama-bin-win-cuda-12.4-x64.zip     <- NVIDIA runtime DLLs
+
+The second one is NOT optional. Without it llama-server.exe fails instantly
+with a missing-DLL error and no useful message.
+
+
+--------------------------------------------------------------------------------
+SCRIPT: D:\ai\bin\01-install-llamacpp.ps1
+--------------------------------------------------------------------------------
+# 01-install-llamacpp.ps1
+# Downloads the newest llama.cpp Windows CUDA 12.4 build + CUDA runtime DLLs.
+$ErrorActionPreference = "Stop"
+
+$Dest = "D:\ai\llama.cpp"
+$Tmp  = "D:\ai\_tmp"
+New-Item -ItemType Directory -Force -Path $Dest, $Tmp | Out-Null
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$hdr = @{ "User-Agent" = "llamacpp-setup" }
+
+Write-Host "Querying GitHub for the latest build that ships a win-cuda-12.4 asset..."
+$releases = Invoke-RestMethod "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=15" -Headers $hdr
+
+$binAsset = $null
+$rtAsset  = $null
+foreach ($r in $releases) {
+    $b = $r.assets | Where-Object { $_.name -like "llama-*-bin-win-cuda-12.4-x64.zip" } | Select-Object -First 1
+    if ($b) {
+        $binAsset = $b
+        $rtAsset  = $r.assets | Where-Object { $_.name -like "cudart-llama-bin-win-cuda-12.4-x64.zip" } | Select-Object -First 1
+        Write-Host "Found release: $($r.tag_name)"
+        break
+    }
+}
+if (-not $binAsset) { throw "No win-cuda-12.4 asset found in the last 15 releases." }
+if (-not $rtAsset)  { throw "Binaries found but cudart runtime zip is missing in that release." }
+
+foreach ($a in @($binAsset, $rtAsset)) {
+    $out = Join-Path $Tmp $a.name
+    Write-Host "Downloading $($a.name) ..."
+    # curl.exe is far faster than Invoke-WebRequest for large files
+    curl.exe -L --fail --progress-bar -o $out $a.browser_download_url
+    if ($LASTEXITCODE -ne 0) { throw "Download failed: $($a.name)" }
+    Write-Host "Extracting $($a.name) ..."
+    Expand-Archive -Path $out -DestinationPath $Dest -Force
+}
+
+Write-Host ""
+Write-Host "Done. Verifying:"
+& "$Dest\llama-server.exe" --version
+--------------------------------------------------------------------------------
+
+Run it:
+
+    powershell -ExecutionPolicy Bypass -File D:\ai\bin\01-install-llamacpp.ps1
+
+SUCCESS LOOKS LIKE: a version line printed, no DLL error.
+
+IF IT FAILS with "is not recognized" -> the zip extracted into a subfolder.
+Check with:
+
+    Get-ChildItem -Recurse -Filter llama-server.exe D:\ai\llama.cpp | Select-Object FullName
+
+and move the contents of that subfolder up into D:\ai\llama.cpp.
+
+
+VERIFY CUDA IS ACTUALLY ACTIVE
+------------------------------
+    D:\ai\llama.cpp\llama-server.exe --list-devices
+
+You must see a CUDA device listed, something like:
+    CUDA0: Quadro T2000 with Max-Q Design (4096 MiB)
+
+If you only see CPU, you downloaded a non-CUDA build or the cudart zip did not
+extract into the same folder.
+
+
+================================================================================
+3. CRITICAL NVIDIA SETTING - DO NOT SKIP
+================================================================================
+
+By default, when a CUDA allocation exceeds VRAM, the Windows driver silently
+spills into system RAM instead of returning an out-of-memory error. Your
+server will still "work" but at maybe 1 tok/s, and you will have no idea why.
+
+Turn this off so you get a clean error instead:
+
+  1. Open NVIDIA Control Panel
+  2. Manage 3D settings  ->  Global Settings  (or Program Settings for
+     llama-server.exe)
+  3. Set "CUDA - Sysmem Fallback Policy"  ->  "Prefer No Sysmem Fallback"
+  4. Also set "Power management mode" -> "Prefer maximum performance"
+  5. Apply
+
+Now if you over-allocate, llama.cpp fails loudly and you just raise
+--n-cpu-moe by 2. That is the whole tuning loop.
+
+
+================================================================================
+4. INSTALL THE HUGGING FACE CLI
+================================================================================
+
+The CLI is now called `hf` (the old `huggingface-cli` name is legacy).
+
+    powershell -ExecutionPolicy ByPass -c "irm https://hf.co/cli/install.ps1 | iex"
+
+Close and reopen PowerShell, then verify:
+
+    hf --version
+
+Alternative if the installer misbehaves:
+
+    pip install -U huggingface_hub
+
+No login is needed - both models below are public and ungated.
+
+
+================================================================================
+5. DOWNLOAD THE MODEL
+================================================================================
+
+PICK ONE. Start with Model A.
+
+--------------------------------------------------------------------------------
+MODEL A - gpt-oss-20b   <<< START HERE >>>
+--------------------------------------------------------------------------------
+  Repo:   unsloth/gpt-oss-20b-GGUF
+  File:   gpt-oss-20b-F16.gguf          (13.8 GB)
+  Layers: 24        (so --n-cpu-moe range is 0 - 24)
+  Active: ~3.6B parameters per token
+
+  WHY F16 AND NOT Q4? The MoE expert tensors in gpt-oss are natively MXFP4
+  and are NOT re-quantized by the Q4/Q5/Q8 variants. That is why every
+  quant in that repo is 11.5-13.8 GB - they only differ in the small
+  non-expert tensors. F16 is therefore the highest quality for almost no
+  extra RAM. Take it.
+
+  Strengths: excellent native tool calling (the thing that matters most for
+  an agent), 128k context, lighter on RAM.
+
+    hf download unsloth/gpt-oss-20b-GGUF gpt-oss-20b-F16.gguf --local-dir D:\ai\models
+
+  If RAM ends up tight, the smaller alternative is:
+    hf download unsloth/gpt-oss-20b-GGUF gpt-oss-20b-UD-Q4_K_XL.gguf --local-dir D:\ai\models
+    (11.9 GB)
+
+--------------------------------------------------------------------------------
+MODEL B - Qwen3-Coder-30B-A3B-Instruct   (try after A works)
+--------------------------------------------------------------------------------
+  Repo:   unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+  File:   Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf    (17.7 GB)
+  Layers: 48        (so --n-cpu-moe range is 0 - 48)
+  Active: ~3.3B parameters per token
+
+  Better at code editing and diff formatting than Model A. Heavier: 17.7 GB
+  of weights leaves less headroom, and its KV cache is roughly 2x the size
+  of gpt-oss per token, so q8_0 KV quantization is mandatory here.
+
+    hf download unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf --local-dir D:\ai\models
+
+  The UD-Q4_K_XL ("Unsloth Dynamic") quant is both smaller AND better quality
+  than the plain Q4_K_M (18.6 GB). Prefer it.
+
+--------------------------------------------------------------------------------
+DO NOT DOWNLOAD: Qwen3-Coder-Next 80B-A3B. Even at Q4 it needs ~45 GB.
+It will not run on 32 GB of RAM.
+--------------------------------------------------------------------------------
+
+Verify the download:
+
+    Get-ChildItem D:\ai\models\*.gguf | Select-Object Name, @{n='GB';e={[math]::Round($_.Length/1GB,1)}}
+
+
+================================================================================
+6. FIRST RUN - CONSERVATIVE CONFIG
+================================================================================
+
+Do NOT start with the aggressive config. Start with everything on the CPU,
+confirm it loads and generates, then claw back performance in step 7.
+
+--------------------------------------------------------------------------------
+SCRIPT: D:\ai\bin\02-start-server.ps1
+--------------------------------------------------------------------------------
+# 02-start-server.ps1
+# Usage:  .\02-start-server.ps1                    -> safe defaults
+#         .\02-start-server.ps1 -NCpuMoe 18 -Ctx 65536
+param(
+    [int]$NCpuMoe = 24,        # gpt-oss-20b has 24 layers; 24 = all experts on CPU
+    [int]$Ctx     = 65536,     # MEASURED: fits at 3489/4096 MiB with q8_0 KV
+    [string]$Model = "D:\ai\models\gpt-oss-20b-F16.gguf",
+    [string]$Alias = "gpt-oss-20b",
+    [switch]$NoQuantKV         # q8_0 KV is ON by default; -NoQuantKV uses f16
+)
+
+$Bin = "D:\ai\llama.cpp\llama-server.exe"
+if (-not (Test-Path $Bin))   { throw "llama-server.exe not found. Run 01-install-llamacpp.ps1 first." }
+if (-not (Test-Path $Model)) { throw "Model not found: $Model" }
+
+$args = @(
+    "-m", $Model,
+    "--alias", $Alias,
+    "--n-cpu-moe", $NCpuMoe,   # keep MoE experts of N layers on CPU
+    "-ngl", "99",              # offload everything else it can to GPU
+    "-c", $Ctx,                # context window
+    "-t", "6",                 # 6 PHYSICAL cores. Do not use 12.
+    "--jinja",                 # REQUIRED for tool calling to work
+    "--host", "127.0.0.1",
+    "--port", "8080",
+    "--metrics"
+)
+if ($QuantKV) { $args += @("--cache-type-k", "q8_0", "--cache-type-v", "q8_0") }
+
+Write-Host "Launching: $Bin $($args -join ' ')`n"
+& $Bin @args
+--------------------------------------------------------------------------------
+
+First launch:
+
+    powershell -ExecutionPolicy Bypass -File D:\ai\bin\02-start-server.ps1
+
+Watch the startup log for these lines:
+    llama_model_loader: ... 24 layers
+    load_tensors: CUDA0 model buffer size = ...    <- confirms GPU is used
+    main: server is listening on http://127.0.0.1:8080
+
+In a SECOND PowerShell window, check it actually answers:
+
+    # DO NOT use curl.exe with inline JSON here. PowerShell 5.1 eats the
+    # backslash escapes before curl.exe ever sees them, and llama-server
+    # answers with a confusing HTTP 500:
+    #   parse error at line 1, column 2 ... last read: '{'
+    # That is a SHELL bug, not a server bug. Proof: the same server answers
+    # fine from a browser at http://127.0.0.1:8080/
+    #
+    # Use Invoke-RestMethod instead - it builds the JSON itself:
+
+    $body = @{
+        model      = "gpt-oss-20b"
+        messages   = @(@{ role = "user"; content = "Reverse a string in Python. Code only." })
+        max_tokens = 120
+    } | ConvertTo-Json -Depth 5
+
+    $r = Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" `
+             -Method Post -ContentType "application/json" -Body $body
+
+    $r.choices[0].message.content
+    $r.timings | Format-List          # prompt_per_second / predicted_per_second
+
+    # If you get HTTP 503 {"message":"Loading model"} - that is NORMAL.
+    # The model is 13.8 GB. Wait for it and retry. Or poll properly:
+    #   do { Start-Sleep 5; try { $h = Invoke-RestMethod http://127.0.0.1:8080/health } catch {} }
+    #   while ($h.status -ne "ok")
+
+And check VRAM headroom while it is loaded:
+
+    nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+
+Write down the "memory.used" number. That is what you will optimize next.
+
+
+================================================================================
+7. TUNE --n-cpu-moe   -- ALREADY DONE, MEASURED ON THIS MACHINE 2026-09-07
+================================================================================
+
+You do not need to run a sweep. It was run on your hardware and the answer is
+settled. Keep this section for reference / for when you switch models.
+
+THE THEORY (still true in general):
+    Lower --n-cpu-moe  = more experts on GPU = faster, but more VRAM
+    Higher --n-cpu-moe = more experts on CPU = slower, but less VRAM
+
+THE MEASUREMENT (llama-bench, clean machine, gpt-oss-20b-F16, f16 KV, -t 6):
+
+    n_cpu_moe |  prefill pp2048  |  generation tg64
+    ----------+------------------+------------------
+        24    |  74.75 +/- 0.34  |  6.29 +/- 0.33     <-- USE THIS
+        22    |  69.92 +/- 10.00 |  4.48 +/- 0.05
+
+On a 4 GB card the theory does not pay off: there is no headroom to move any
+experts onto the GPU. 24 (all experts on CPU) wins on BOTH prefill and
+generation. Anything lower is slower AND less stable -- note the +/- 10.00
+variance at 22 versus +/- 0.34 at 24. That variance is the tell.
+
+WARNING - the mistake that cost us an hour:
+Do NOT run a sweep while llama-server is also running, and do not run two
+sweeps at once. The model is 12.83 GiB; two copies do not fit in 31.8 GB RAM.
+The result is not an error -- it is silently wrong numbers (we measured the
+SAME config at 3.48 and at 75.10 tok/s). tune-moe.ps1 now refuses to start if
+llama-server is up, but nothing can protect you from launching it twice.
+
+--------------------------------------------------------------------------------
+SCRIPT: D:iin	une-moe.ps1   (rev2 - uses llama-bench, not llama-cli)
+--------------------------------------------------------------------------------
+The original version parsed llama-cli stdout with a regex. That was fragile and
+printed "could not parse speed" for every value, hiding the real cause. Use
+llama-bench instead: it is built for exactly this and has -ncmoe natively.
+
+    powershell -ExecutionPolicy Bypass -File D:iin	une-moe.ps1
+
+Only re-run it if you change MODEL. For Qwen3-Coder-30B (48 layers) pass:
+    -Values "48,44,40,36,32"
+
+
+PRODUCTION CONTEXT - MEASURED, FITS
+-----------------------------------
+    --n-cpu-moe 24  -c 65536  --cache-type-k q8_0 --cache-type-v q8_0
+
+    VRAM: 3489 / 4096 MiB      (~600 MiB headroom)
+
+Compare: -c 32768 with f16 KV used 3419 MiB. So 64k context with q8_0 KV costs
+only 70 MiB MORE than 32k with f16 -- because double the tokens at half the
+per-token cost is the same KV cache. There is no reason to run 32k. q8_0 KV is
+now ON by default in start-server.ps1; -NoQuantKV turns it off.
+
+Verified working at this config:
+  - chat completion            OK
+  - tool calling (--jinja)     OK, emits proper tool_calls with escaped JSON
+
+
+REAL THROUGHPUT - PLAN ON THESE NUMBERS
+---------------------------------------
+    prefill (prompt processing)      ~75 tok/s
+    generation, sustained 600 tok    ~8.3 tok/s     <-- plan on this
+    generation, short burst ~100 tok  ~12.5 tok/s
+
+Short replies look about 50% faster than long ones. Do not size the night loop
+on a burst number. At ~75 tok/s prefill, a 20k-token prompt costs ~4.5 minutes
+BEFORE the first token appears -- so prompt size, not generation speed, is what
+governs how many tasks finish overnight. Keep each task's context small.
+
+If you ever see generation around 0.5-1 tok/s, that is not "slow", that is the
+CUDA sysmem fallback in section 3 spilling VRAM into system RAM. Go fix it.
+
+
+================================================================================
+8. INSTALL AND CONFIGURE OPENCODE
+================================================================================
+
+You have Node v26.7.0 already, so:
+
+    npm install -g opencode-ai
+
+Verify (open a new terminal so PATH refreshes):
+
+    opencode --version
+
+--------------------------------------------------------------------------------
+CONFIG - global, applies to every project
+File: %USERPROFILE%\.config\opencode\opencode.json
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp local",
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1"
+      },
+      "models": {
+        "gpt-oss-20b": {
+          "name": "gpt-oss-20b (local)"
+        }
+      }
+    }
+  },
+  "model": "local/gpt-oss-20b"
+}
+--------------------------------------------------------------------------------
+
+Create it:
+
+    New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.config\opencode" | Out-Null
+    notepad "$env:USERPROFILE\.config\opencode\opencode.json"
+
+IMPORTANT: the key under "models" must exactly match the --alias you passed to
+llama-server.exe. If you switch to Model B, change BOTH the --alias and this
+key to the same new string, or OpenCode will send a model name the server
+does not recognize.
+
+Smoke test - with the server running, from any project folder:
+
+    opencode run "List the files in this directory and tell me what kind of project this is."
+
+If it reads files and answers, the whole chain works.
+
+
+================================================================================
+9. KEEP OLLAMA AS A FALLBACK  (optional)
+================================================================================
+
+You already have Ollama 0.32.13. It is easier but slower here because it
+cannot do MoE expert placement. Keep it for quick one-off questions.
+
+The one thing you MUST change: the default context is 4096, which silently
+breaks agent tool calling. Set these as PERMANENT user environment variables
+(not just in the current shell):
+
+    [Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH",  "65536", "User")
+    [Environment]::SetEnvironmentVariable("OLLAMA_FLASH_ATTENTION", "1",     "User")
+    [Environment]::SetEnvironmentVariable("OLLAMA_KV_CACHE_TYPE",   "q8_0",  "User")
+    [Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE",      "-1",    "User")
+
+Then restart the Ollama service (quit it from the system tray and relaunch).
+
+    ollama pull gpt-oss:20b
+
+Verify the setting took effect:
+
+    ollama ps        (the CONTEXT column should show 65536, not 4096)
+
+
+================================================================================
+10. PREPARE THE MACHINE FOR OVERNIGHT RUNS
+================================================================================
+
+Run these ONCE, in an ADMINISTRATOR PowerShell:
+
+    # Never sleep while plugged in (0 = never)
+    powercfg /change standby-timeout-ac 0
+    powercfg /change hibernate-timeout-ac 0
+    powercfg /change monitor-timeout-ac 10
+
+    # Use the High performance power plan
+    powercfg /setactive SCHEME_MIN
+
+    # Confirm
+    powercfg /query SCHEME_CURRENT SUB_SLEEP | Select-String "Current AC Power Setting"
+
+Also:
+  - Leave the laptop PLUGGED IN. On battery the CPU throttles hard and your
+    8-hour run becomes a 20-hour run.
+  - Pause Windows Update active hours / defer restarts for the night.
+  - Elevate the laptop or use a cooling pad. The 5550 chassis will thermal
+    throttle a 6-core CPU held at 100% for 8 hours, and throttling costs you
+    more tokens than any flag in this guide.
+  - Check thermals mid-run with:
+        nvidia-smi --query-gpu=temperature.gpu,clocks.sm --format=csv
+
+
+================================================================================
+11. QUICK REFERENCE - FINAL COMMANDS
+================================================================================
+
+Start the server (adjust NCpuMoe to your tuned value):
+
+    powershell -ExecutionPolicy Bypass -File D:\ai\bin\02-start-server.ps1 -NCpuMoe 16 -Ctx 65536
+
+Start the server for Model B (Qwen3-Coder):
+
+    powershell -ExecutionPolicy Bypass -File D:\ai\bin\02-start-server.ps1 `
+      -Model "D:\ai\models\Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf" `
+      -Alias "qwen3-coder-30b" -NCpuMoe 40 -Ctx 65536 -QuantKV
+
+Health check:
+
+    curl.exe -s http://127.0.0.1:8080/health
+
+Stop the server:
+
+    Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+
+Watch GPU while running:
+
+    while ($true) { nvidia-smi --query-gpu=memory.used,utilization.gpu,temperature.gpu --format=csv,noheader; Start-Sleep 5 }
+
+
+================================================================================
+12. TROUBLESHOOTING
+================================================================================
+
+SYMPTOM                              CAUSE / FIX
+-------------------------------------------------------------------------------
+
+HTTP 500 "parse error at line 1,     NOT a server bug. PowerShell 5.1 mangled
+column 2 ... syntax error"           the backslash escapes in curl.exe -d
+                                     before curl ever saw them. Use
+                                     Invoke-RestMethod instead (see step 6).
+                                     Sanity check: the browser UI at
+                                     http://127.0.0.1:8080/ works fine.
+
+HTTP 503 {"message":"Loading model"} Normal. 13.8 GB is still loading from
+                                     disk. Poll /health until status = ok.
+
+tune script prints "could not parse  Old rev1 script, and/or llama-server was
+speed" for every value               still running and holding the VRAM.
+                                     Use rev2 (llama-bench) and stop the
+                                     server first. See step 7.
+
+Benchmark numbers wildly different   Two processes loaded the model at once
+between runs of the SAME config      (12.83 GiB each, 31.8 GB RAM total).
+(e.g. 3.48 vs 75.10 tok/s)           Never run two sweeps, or a sweep plus
+                                     the server. Check first with:
+                                         Get-Process llama-server,llama-bench
+
+llama-server.exe exits immediately,  cudart zip was not extracted into
+no output, or "DLL not found"        D:\ai\llama.cpp. Re-run step 2.
+
+--list-devices shows only CPU        You have the CPU-only build, or the CUDA
+                                     runtime DLLs are missing. Re-download
+                                     both zips from the SAME release.
+
+"CUDA out of memory" on load         Raise --n-cpu-moe by 2. If already at max
+                                     layers, add -QuantKV, then lower -Ctx.
+
+Loads fine but ~1 tok/s              Sysmem fallback is silently spilling VRAM
+                                     into RAM. Do step 3.
+                                     Also check you passed -t 6, not -t 12.
+
+Tool calling never fires /           Missing --jinja, OR context below 32k.
+agent does nothing but chat          Both cause silent failure, no error.
+
+OpenCode: "model not found"          The "models" key in opencode.json does not
+                                     match the --alias on llama-server.
+
+Very slow first response, then       Normal. MoE prefill on CPU is the known
+normal speed                         bottleneck. Keep prompts short - this is
+                                     exactly why the overnight runner sends one
+                                     small task per call instead of one big one.
+
+Speed drops after ~1 hour            Thermal throttling. Check temps, improve
+                                     airflow, confirm it is on AC power.
+
+Machine asleep in the morning,       powercfg settings from step 10 were not
+job half done                        applied, or not run as Administrator.
+
+
+================================================================================
+13. WHAT COMES NEXT
+================================================================================
+
+Once step 8's smoke test passes, the remaining pieces are:
+
+  a) RULES.md / ARCHITECTURE.md / STACK.md / AGENTS.md
+     The rule files, written in the deterministic style a 3B-active model
+     actually follows.
+
+  b) TASKS.md
+     The task list, decomposed so each item is <= 30 lines of code.
+
+  c) night-run.ps1
+     The overnight loop: one task per call, test, commit on green,
+     git reset + mark BLOCKED on red.
+     (Draft is in local-ai-setup-ar.txt, section 6.)
+
+Do NOT skip straight to (c). A loop running against an untuned server just
+produces 8 hours of garbage commits very slowly.
+
+
+================================================================================
+SOURCES
+================================================================================
+
+llama.cpp releases (asset naming, CUDA builds)
+  https://github.com/ggml-org/llama.cpp/releases
+
+--n-cpu-moe flag explained
+  https://aliteq.com/n-cpu-moe-llama-cpp-what-it-actually-does
+  https://aliteq.com/run-big-moe-model-small-gpu-n-cpu-moe-guide
+
+Hugging Face CLI (hf download, --local-dir)
+  https://huggingface.co/docs/huggingface_hub/guides/cli
+
+Model repos
+  https://huggingface.co/unsloth/gpt-oss-20b-GGUF
+  https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
+
+OpenCode + Ollama integration (64k context requirement)
+  https://docs.ollama.com/integrations/opencode
+
+================================================================================
+                                END OF FILE
+================================================================================
