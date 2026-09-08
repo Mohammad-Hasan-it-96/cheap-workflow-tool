@@ -1,5 +1,5 @@
 <#
-    night-run.ps1 - unattended task runner for a local llama.cpp + opencode setup.
+    night-run.ps1 - unattended task runner for overnight code work.
 
     ONE TASK PER MODEL CALL, FRESH CONTEXT EACH TIME.
     That is the whole trick. A single long-running prompt always dies: context
@@ -9,19 +9,40 @@
         -> red:   git reset --hard and mark [!] BLOCKED, then move on
     So a task that goes wrong costs you one task, not the whole night.
 
+    EXECUTORS - who actually writes the code
+        claude    Claude Code headless (claude -p). Uses the subscription you
+                  already pay for, so it adds no cost, and it is by far the
+                  strongest option. Bounded by your 5-hour / weekly usage
+                  windows.
+        opencode  opencode against any provider in opencode.json:
+                  local/gpt-oss-20b   llama.cpp on this machine, unlimited but
+                                      ~6 tok/s
+                  openrouter/<model>  free tier: 50 requests/day, or 1000/day
+                                      once you have ever bought $10 of credit
+        auto      DEFAULT. Claude until its usage window is exhausted, then it
+                  switches to opencode for the rest of the night instead of
+                  stopping. This is the free-overnight setup: the subscription
+                  does as much as it can, the local model finishes the queue.
+
     USAGE
         .\night-run.ps1 -Root "D:\work\my-project"
-        .\night-run.ps1 -Root "D:\work\my-project" -TestCmd "php artisan test" -TaskTimeoutMin 25
+        .\night-run.ps1 -Root "D:\work\my-project" -Executor claude -ClaudeModel opus
+        .\night-run.ps1 -Root "D:\work\my-project" -Executor opencode -OpenCodeModel local/gpt-oss-20b
         .\night-run.ps1 -Root "D:\work\my-project" -DryRun     # plan only, no model, no writes
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Root,
-    [string]$TestCmd        = "",                 # auto-detected when empty
-    [string]$Model          = "local/gpt-oss-20b",
-    [string]$ServerUrl      = "http://127.0.0.1:8080",
-    [int]   $TaskTimeoutMin = 20,
-    [int]   $MaxRetries     = 1,
+    [ValidateSet("auto","claude","opencode")]
+    [string]$Executor         = "auto",
+    [string]$ClaudeModel      = "sonnet",
+    [ValidateSet("acceptEdits","bypassPermissions")]
+    [string]$ClaudePermission = "acceptEdits",
+    [string]$OpenCodeModel    = "local/gpt-oss-20b",
+    [string]$TestCmd          = "",                 # auto-detected when empty
+    [string]$ServerUrl        = "http://127.0.0.1:8080",
+    [int]   $TaskTimeoutMin   = 20,
+    [int]   $MaxRetries       = 1,
     [switch]$NoCommit,
     [switch]$AllowTestEdits,
     [switch]$DryRun
@@ -34,7 +55,37 @@ function Write-Log {
     param([string]$Msg, [string]$Color = "Gray")
     $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Msg
     Write-Host $line -ForegroundColor $Color
-    Add-Content -Path $script:LogFile -Value $line -Encoding utf8
+    if ($script:LogFile) { Add-Content -Path $script:LogFile -Value $line -Encoding utf8 }
+}
+
+# Always write UTF-8 WITHOUT a BOM. Set-Content -Encoding utf8 on PS 5.1 adds
+# one, which drops a stray marker into the user's TASKS.md on every rewrite.
+function Write-Lines {
+    param([string]$Path, [string[]]$Lines)
+    [IO.File]::WriteAllLines($Path, $Lines, (New-Object System.Text.UTF8Encoding $false))
+}
+
+# Every git call goes through here. Two PowerShell 5.1 traps make the naive
+# `& git ... 2>$null` form unsafe for an 8-hour unattended run:
+#
+#  1. Redirecting a native command's stderr wraps each line in a
+#     NativeCommandError record. Under $ErrorActionPreference = "Stop" that
+#     THROWS, so a harmless git warning kills the whole night.
+#  2. $LASTEXITCODE is the only honest success signal for a native exe.
+#
+# Returns the exit code and the combined output, and never throws on its own.
+function Invoke-Git {
+    param([string]$Dir, [string[]]$GitArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = & git -C $Dir @GitArgs 2>&1 | ForEach-Object { "$_" }
+        return [pscustomobject]@{
+            Code   = $LASTEXITCODE
+            Output = ($out -join "`n")
+            Lines  = @($out)
+        }
+    } finally { $ErrorActionPreference = $prev }
 }
 
 function Resolve-OpenCodeExe {
@@ -45,6 +96,19 @@ function Resolve-OpenCodeExe {
     $exe = Join-Path (Split-Path $cmd.Source -Parent) "node_modules\opencode-ai\bin\opencode.exe"
     if (Test-Path $exe) { return $exe }
     throw "Found shim '$($cmd.Source)' but no opencode.exe beside it."
+}
+
+function Resolve-ClaudeExe {
+    $cmd = Get-Command claude -ErrorAction SilentlyContinue
+    if (-not $cmd) { throw "claude is not on PATH. Install Claude Code first." }
+    if ($cmd.Source -like "*.exe" -or $cmd.Source -like "*.cmd") { return $cmd.Source }
+    # Start-Process cannot launch a .ps1 shim; find the .cmd or .exe beside it
+    $dir = Split-Path $cmd.Source -Parent
+    foreach ($n in @("claude.exe", "claude.cmd")) {
+        $p = Join-Path $dir $n
+        if (Test-Path $p) { return $p }
+    }
+    throw "Found shim '$($cmd.Source)' but no claude.exe/.cmd beside it."
 }
 
 # Returns the first test file the task modified, or $null.
@@ -62,7 +126,7 @@ function Get-TouchedTestFile {
         '(^|/)tests?/', '(^|/)spec/', '\.test\.', '\.spec\.',
         '_test\.', 'Test\.php$', 'Tests\.php$', '_test\.dart$', '(^|/)test\.js$'
     )
-    foreach ($line in (& git -C $Dir status --porcelain)) {
+    foreach ($line in (Invoke-Git -Dir $Dir -GitArgs @("status", "--porcelain")).Lines) {
         $f = ($line.Substring(2)).Trim() -replace '\\', '/' -replace '^"|"$', ''
         foreach ($p in $patterns) { if ($f -match $p) { return $f } }
     }
@@ -83,17 +147,40 @@ function Get-TestCommand {
     return ""
 }
 
+# Did the executor stop because we ran out of quota, rather than because the
+# task was hard? Only consulted on a NON-ZERO exit, so a task that legitimately
+# writes the words "rate limit" into a source file cannot trip it.
+function Test-UsageLimited {
+    param([string]$LogPath)
+    if (-not (Test-Path $LogPath)) { return $false }
+    $t = Get-Content $LogPath -Raw -ErrorAction SilentlyContinue
+    if (-not $t) { return $false }
+    return $t -match '(?i)usage limit reached|rate limit|too many requests|\b429\b|quota exceeded|insufficient credits'
+}
+
 # Runs a native command with a hard timeout. Returns its exit code, or -1 on timeout.
 # Start-Process is used deliberately: in PowerShell 5.1, piping a native command
 # with 2>&1 wraps stderr in NativeCommandError records and corrupts $LASTEXITCODE.
 function Invoke-WithTimeout {
     param([string]$FilePath, [string[]]$Arguments, [string]$WorkDir,
-          [int]$TimeoutSec, [string]$OutFile)
+          [int]$TimeoutSec, [string]$OutFile, [string]$StdinFile)
 
     $errFile = "$OutFile.err"
-    $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments `
-                       -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
-                       -RedirectStandardOutput $OutFile -RedirectStandardError $errFile
+    $sp = @{
+        FilePath               = $FilePath
+        ArgumentList           = $Arguments
+        WorkingDirectory       = $WorkDir
+        NoNewWindow            = $true
+        PassThru               = $true
+        RedirectStandardOutput = $OutFile
+        RedirectStandardError  = $errFile
+    }
+    # The prompt goes in on stdin, never as an argument. claude.cmd routes
+    # through cmd.exe, which would mangle a multi-line prompt containing
+    # & | ^ or %. A redirected file has no quoting rules at all.
+    if ($StdinFile) { $sp.RedirectStandardInput = $StdinFile }
+
+    $p = Start-Process @sp
 
     # MUST cache the process handle before the process exits, otherwise
     # $p.ExitCode is silently $null and every task looks like a failure.
@@ -105,6 +192,12 @@ function Invoke-WithTimeout {
     if (-not $p.WaitForExit($TimeoutSec * 1000)) {
         Write-Log "  TIMEOUT after $TimeoutSec s - killing process tree" "Red"
         try { taskkill /PID $p.Id /T /F | Out-Null } catch { }
+        # Fold stderr in even on the timeout path, or the log loses the reason.
+        if (Test-Path $errFile) {
+            $e = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+            if ($e) { Add-Content -Path $OutFile -Value $e -Encoding utf8 }
+            Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+        }
         return -1
     }
     if (Test-Path $errFile) {
@@ -121,6 +214,28 @@ function Invoke-WithTimeout {
     return $code
 }
 
+# Builds the command line for whichever executor is currently active.
+function Get-ExecutorInvocation {
+    param([string]$Kind, [string]$PromptFile)
+    if ($Kind -eq "claude") {
+        return @{
+            File  = $script:ClaudeExe
+            Args  = @("-p", "--model", $ClaudeModel,
+                      "--permission-mode", $ClaudePermission,
+                      "--output-format", "text")
+            Stdin = $PromptFile          # prompt arrives on stdin, not argv
+            Label = "claude/$ClaudeModel"
+        }
+    }
+    return @{
+        File  = $script:OpenCodeExe
+        Args  = @("run", "--auto", "--model", $OpenCodeModel,
+                  [IO.File]::ReadAllText($PromptFile))
+        Stdin = $null                    # a real .exe, so argv is safe here
+        Label = "opencode/$OpenCodeModel"
+    }
+}
+
 # ------------------------------------------------------------- preflight ---
 if (-not (Test-Path $Root)) { throw "Root not found: $Root" }
 $Root      = (Resolve-Path $Root).Path
@@ -135,21 +250,26 @@ if (-not (Test-Path $TasksFile)) {
 # untracked and the dirty check below would always fail. And because the loop
 # runs `git add -A`, an un-excluded .agent/ would commit its own logs into
 # the repo on every task.
-& git -C $Root rev-parse --is-inside-work-tree 1>$null 2>$null
-if ($LASTEXITCODE -ne 0) {
+if ((Invoke-Git -Dir $Root -GitArgs @("rev-parse", "--is-inside-work-tree")).Code -ne 0) {
     throw "$Root is not a git repository. Run git init and make one commit first - rollback depends on it."
 }
 
-# .git/info/exclude is local and untracked, so writing here cannot dirty the tree
-$excludeFile = Join-Path $Root ".git\info\exclude"
-if (Test-Path $excludeFile) {
-    $ex = Get-Content $excludeFile -Raw -ErrorAction SilentlyContinue
-    if ($ex -notmatch '(?m)^\.agent/\s*$') {
-        Add-Content -Path $excludeFile -Value "`n.agent/" -Encoding utf8
-    }
+# Ask git where its dir actually is - inside a worktree, .git is a FILE.
+$gitDir = (Invoke-Git -Dir $Root -GitArgs @("rev-parse", "--git-dir")).Output.Trim()
+if (-not [IO.Path]::IsPathRooted($gitDir)) { $gitDir = Join-Path $Root $gitDir }
+
+# .git/info/exclude is local and untracked, so writing here cannot dirty the
+# tree. CREATE it when missing: if this step silently does nothing, .agent/
+# stays visible to git and `git add -A` commits the night's logs into the repo.
+$infoDir     = Join-Path $gitDir "info"
+$excludeFile = Join-Path $infoDir "exclude"
+if (-not (Test-Path $infoDir)) { New-Item -ItemType Directory -Force -Path $infoDir | Out-Null }
+$ex = if (Test-Path $excludeFile) { Get-Content $excludeFile -Raw -ErrorAction SilentlyContinue } else { "" }
+if ($ex -notmatch '(?m)^\.agent/\s*$') {
+    Add-Content -Path $excludeFile -Value "`n.agent/" -Encoding utf8
 }
 
-$dirty = & git -C $Root status --porcelain
+$dirty = (Invoke-Git -Dir $Root -GitArgs @("status", "--porcelain")).Lines
 if ($dirty) {
     throw "Working tree is dirty. Commit or stash first, otherwise a rollback will destroy your own changes.`n$($dirty -join "`n")"
 }
@@ -179,16 +299,53 @@ try {
         Write-Log "tests   : $TestCmd"
     }
 
-    $ocExe = Resolve-OpenCodeExe
-    Write-Log "opencode: $ocExe"
-
-    try {
-        $h = Invoke-RestMethod "$ServerUrl/health" -TimeoutSec 10
-        if ($h.status -ne "ok") { throw "status=$($h.status)" }
-    } catch {
-        throw "llama-server is not healthy at $ServerUrl. Start it with: D:\ai\bin\start-server.ps1"
+    if ($NoCommit) {
+        # Without commits there is no safe point to reset to, so rollback is off
+        # as well - otherwise the first failure would wipe every earlier task.
+        Write-Log "WARNING: -NoCommit is set. Nothing is committed AND nothing is" "Yellow"
+        Write-Log "         rolled back, so a failed task leaves its mess behind." "Yellow"
+        Write-Log "         Use this to try the runner out, never for a real night." "Yellow"
     }
-    Write-Log "server  : ok ($Model)"
+
+    # --- executor setup -----------------------------------------------------
+    $script:Active   = if ($Executor -eq "auto") { "claude" } else { $Executor }
+    $script:Fallback = if ($Executor -eq "auto") { "opencode" } else { $null }
+
+    if ($script:Active -eq "claude" -or $script:Fallback -eq "claude") {
+        $script:ClaudeExe = Resolve-ClaudeExe
+        Write-Log "claude  : $($script:ClaudeExe) (model $ClaudeModel, $ClaudePermission)"
+    }
+    if ($script:Active -eq "opencode" -or $script:Fallback -eq "opencode") {
+        $script:OpenCodeExe = Resolve-OpenCodeExe
+        Write-Log "opencode: $($script:OpenCodeExe) (model $OpenCodeModel)"
+    }
+
+    # Only ping llama-server when a local model can actually be reached for.
+    # A claude-only run must not require a 13 GB server to be up.
+    $needsLocal = ($script:Active -eq "opencode" -or $script:Fallback -eq "opencode") -and
+                  ($OpenCodeModel -like "local/*")
+    if ($needsLocal) {
+        $healthy = $false
+        try {
+            $h = Invoke-RestMethod "$ServerUrl/health" -TimeoutSec 10
+            $healthy = ($h.status -eq "ok")
+        } catch { $healthy = $false }
+
+        if ($healthy) {
+            Write-Log "server  : ok at $ServerUrl"
+        } elseif ($script:Active -eq "opencode") {
+            throw "llama-server is not healthy at $ServerUrl. Start it with: D:\ai\bin\start-server.ps1"
+        } else {
+            # claude is driving; local is only the safety net. Warn, do not block.
+            Write-Log "WARNING: llama-server is DOWN at $ServerUrl." "Yellow"
+            Write-Log "         The run starts on claude, but when its usage window is" "Yellow"
+            Write-Log "         exhausted there is nothing to fall back to and the night" "Yellow"
+            Write-Log "         will stop early. Start the server to cover the whole night." "Yellow"
+        }
+    }
+    $fbNote = ""
+    if ($script:Fallback) { $fbNote = " (falls back to $($script:Fallback) on usage limit)" }
+    Write-Log "executor: $($script:Active)$fbNote"
 
     if ($DryRun) {
         Write-Log "--- DRY RUN: queued tasks ---" "Cyan"
@@ -205,34 +362,78 @@ try {
         $hit = Select-String -Path $TasksFile -Pattern '^\s*-\s*\[ \]\s+(.+)$' | Select-Object -First 1
         if (-not $hit) { Write-Log "=== QUEUE EMPTY ===" "Cyan"; break }
 
-        $task    = $hit.Matches[0].Groups[1].Value.Trim()
-        $taskRaw = $hit.Line
+        $task   = $hit.Matches[0].Groups[1].Value.Trim()
+        $lineNo = $hit.LineNumber          # 1-based; used to edit the exact line
         Write-Log ""
         Write-Log "TASK: $task" "Cyan"
 
-        $base = (& git -C $Root rev-parse HEAD).Trim()
+        $base = (Invoke-Git -Dir $Root -GitArgs @("rev-parse", "HEAD")).Output.Trim()
         $ok   = $false
 
-        for ($try = 1; $try -le ($MaxRetries + 1); $try++) {
-            if ($try -gt 1) { Write-Log "  retry $($try - 1) of $MaxRetries" "Yellow" }
+        $n           = $done + $blocked + 1
+        $attempt     = 0
+        $maxAttempts = $MaxRetries + 1
+
+        while ($attempt -lt $maxAttempts) {
+            $attempt++
+
+            # ROLL BACK BEFORE RETRYING. Without this a retry starts on top of
+            # the previous attempt's half-finished edits - and if attempt 1 was
+            # rejected for touching a test file, that file is STILL modified, so
+            # every retry is rejected for the same reason and can never pass.
+            if ($attempt -gt 1) {
+                Write-Log "  attempt $attempt of $maxAttempts - resetting to $($base.Substring(0,7)) first" "Yellow"
+                $null = Invoke-Git -Dir $Root -GitArgs @("reset", "--hard", $base)
+                $null = Invoke-Git -Dir $Root -GitArgs @("clean", "-fd")
+            }
 
             # The prompt is deliberately SHORT and STABLE across tasks:
             # llama-server caches the common prefix, so identical wording is
-            # genuinely faster. The real rules live in AGENTS.md, which
-            # opencode loads on its own.
+            # genuinely faster. The real rules live in AGENTS.md, which both
+            # opencode and Claude Code load on their own.
             $prompt = "Task: $task`n`n" +
                       "Follow AGENTS.md exactly.`n" +
                       "Change only what this task requires. Do not refactor or tidy anything else.`n" +
                       "When the task is done, stop. Do not start another task."
 
-            $n       = $done + $blocked + 1
-            $outFile = Join-Path $AgentDir ("task-{0}-{1:d3}.log" -f $stamp, $n)
+            $outFile    = Join-Path $AgentDir ("task-{0}-{1:d3}.log" -f $stamp, $n)
+            $promptFile = Join-Path $AgentDir ("task-{0}-{1:d3}.prompt" -f $stamp, $n)
+            [IO.File]::WriteAllText($promptFile, $prompt, (New-Object System.Text.UTF8Encoding $false))
 
-            $rc = Invoke-WithTimeout -FilePath $ocExe `
-                     -Arguments @("run", "--auto", "--model", $Model, $prompt) `
-                     -WorkDir $Root -TimeoutSec ($TaskTimeoutMin * 60) -OutFile $outFile
+            $inv = Get-ExecutorInvocation -Kind $script:Active -PromptFile $promptFile
+            Write-Log "  running on $($inv.Label)"
 
-            if ($rc -ne 0) { Write-Log "  opencode exited $rc -> $outFile" "Yellow"; continue }
+            $rc = Invoke-WithTimeout -FilePath $inv.File -Arguments $inv.Args `
+                     -WorkDir $Root -TimeoutSec ($TaskTimeoutMin * 60) `
+                     -OutFile $outFile -StdinFile $inv.Stdin
+
+            if ($rc -ne 0) {
+                Write-Log "  $($script:Active) exited $rc -> $outFile" "Yellow"
+
+                # Out of quota, not out of ability. Switch executors and give
+                # the new one a full retry budget - this attempt does not count
+                # against the task, because the task was never really tried.
+                if ($script:Fallback -and (Test-UsageLimited -LogPath $outFile)) {
+                    Write-Log "  USAGE LIMIT on $($script:Active). Switching to $($script:Fallback) for the rest of the night." "Magenta"
+                    $script:Active   = $script:Fallback
+                    $script:Fallback = $null
+                    $maxAttempts     = $attempt + $MaxRetries + 1
+                }
+                continue
+            }
+
+            # Did it actually do anything? An executor that reads files, decides
+            # the work is already done and exits 0 would otherwise sail through
+            # the test gate on the suite's existing green and be marked [x] with
+            # no commit behind it.
+            # TASKS.md is excluded: it is the runner's own bookkeeping, and an
+            # executor that ticks its own box must not thereby look productive.
+            $changed = @((Invoke-Git -Dir $Root -GitArgs @("status", "--porcelain")).Lines |
+                         Where-Object { $_ -notmatch '(?i)[/\\ ]TASKS\.md"?$' })
+            if (-not $changed) {
+                Write-Log "  NO CHANGES - the executor edited nothing. Not a pass." "Yellow"
+                continue
+            }
 
             # The task may not edit the tests that grade it. Tag a task with
             # [test] when writing tests IS the task, or pass -AllowTestEdits.
@@ -255,23 +456,69 @@ try {
             Write-Log "  tests failed (exit $trc) -> $testOut" "Yellow"
         }
 
-        $content = Get-Content $TasksFile -Raw
+        # --- record the result on the EXACT queue line -----------------------
+        # Edit by line number, never by String.Replace: Replace() rewrites every
+        # identical line in the file, so two same-worded tasks would both be
+        # ticked and the second would silently never run.
+        #
+        # ORDER MATTERS, and it is the opposite of what looks natural: the queue
+        # mark is written BEFORE the commit, so that the mark and the work it
+        # describes land in the SAME commit. Marking afterwards leaves TASKS.md
+        # permanently dirty, which (a) makes every later task look like it
+        # changed something and (b) lets `git reset --hard` on a blocked task
+        # revert earlier [x] marks and re-run tasks that were already done.
+        # The invariant this buys: the tree is clean at the top of every task.
+        $lines  = [IO.File]::ReadAllLines($TasksFile)
+        $idx    = $lineNo - 1
+        $before = $lines[$idx]
+
         if ($ok) {
-            if (-not $NoCommit) {
-                & git -C $Root add -A
-                & git -C $Root commit -q -m "feat: $task" 1>$null 2>$null
-            }
-            $content = $content.Replace($taskRaw, $taskRaw.Replace("- [ ]", "- [x]"))
-            $done++
-            Write-Log "  PASSED + committed" "Green"
+            $lines[$idx] = $before -replace '^(\s*-\s*)\[ \]', '${1}[x]'
         } else {
-            & git -C $Root reset --hard $base 1>$null 2>$null
-            & git -C $Root clean -fd 1>$null 2>$null
-            $content = $content.Replace($taskRaw, $taskRaw.Replace("- [ ]", "- [!]") + "  <!-- BLOCKED $stamp -->")
+            # Roll back FIRST - that also undoes any edit the executor made to
+            # TASKS.md - then re-read and mark the line as blocked.
+            if (-not $NoCommit) {
+                $null = Invoke-Git -Dir $Root -GitArgs @("reset", "--hard", $base)
+                $null = Invoke-Git -Dir $Root -GitArgs @("clean", "-fd")
+                $lines  = [IO.File]::ReadAllLines($TasksFile)
+                $before = $lines[$idx]
+            }
+            $lines[$idx] = ($before -replace '^(\s*-\s*)\[ \]', '${1}[!]') + "  <!-- BLOCKED $stamp -->"
+        }
+
+        if ($lines[$idx] -eq $before) {
+            # The queue line did not change, so the next pass would pick the very
+            # same task and spin here forever. Fail loudly instead.
+            throw "Could not mark task line $lineNo in TASKS.md. This is a night-run bug. Line was: $before"
+        }
+        Write-Lines -Path $TasksFile -Lines $lines
+
+        if (-not $NoCommit) {
+            $null = Invoke-Git -Dir $Root -GitArgs @("add", "-A")
+
+            # The message goes in via -F, never -m. A task line routinely
+            # contains double quotes ("Hello, <name>!"), a $ or a backtick, and
+            # PowerShell's native-argument rules would split it mid-message -
+            # git then reads the tail as a pathspec and the commit fails.
+            # This used to be silent: the failure was swallowed by 2>$null and
+            # the task was ticked [x] with nothing committed behind it.
+            $msg     = if ($ok) { "feat: $task" } else { "chore: blocked - $task" }
+            $msgFile = Join-Path $AgentDir "commit-msg.txt"
+            [IO.File]::WriteAllText($msgFile, $msg, (New-Object System.Text.UTF8Encoding $false))
+
+            $c = Invoke-Git -Dir $Root -GitArgs @("commit", "-q", "-F", $msgFile)
+            if ($c.Code -ne 0) {
+                throw "git commit failed after a task (exit $($c.Code)). Stopping, because the next task would otherwise build on an uncommitted tree.`n$($c.Output)"
+            }
+        }
+
+        if ($ok) {
+            $done++
+            Write-Log "  PASSED + committed ($($script:Active))" "Green"
+        } else {
             $blocked++
             Write-Log "  BLOCKED - rolled back, moving on" "Red"
         }
-        Set-Content -Path $TasksFile -Value $content -Encoding utf8 -NoNewline
     }
 
     $mins = [int]((Get-Date) - $t0).TotalMinutes

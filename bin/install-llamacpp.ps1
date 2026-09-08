@@ -1,4 +1,4 @@
-# 01-install-llamacpp.ps1
+# install-llamacpp.ps1
 # Downloads the newest llama.cpp Windows CUDA 12.4 build + CUDA runtime DLLs.
 $ErrorActionPreference = "Stop"
 

@@ -132,7 +132,32 @@ MARKERS
 5. RUNNING IT
 --------------------------------------------------------------------------------
 
-Start the model server first (leave it running all night):
+WHO WRITES THE CODE - pick an executor
+
+  -Executor claude     Claude Code headless (claude -p). Uses the subscription
+                       you already pay for, so it costs nothing extra, and it
+                       is far and away the strongest option. ~30 s per task
+                       instead of 4-8 minutes. Bounded by your 5-hour and
+                       weekly usage windows, not by tokens you buy.
+
+  -Executor opencode   opencode against whatever is in opencode.json:
+                         local/gpt-oss-20b   this machine. Unlimited, private,
+                                             ~6.2 tok/s, 4-8 min per task.
+                         openrouter/<model>  free tier. 50 requests/day, or
+                                             1000/day once you have ever
+                                             bought $10 of credit. Below that
+                                             threshold it dies in the first
+                                             hour - see the install guide.
+
+  -Executor auto       DEFAULT. Claude until its usage window is exhausted,
+                       then it switches to opencode for the rest of the night
+                       instead of stopping. THIS IS THE FREE OVERNIGHT SETUP:
+                       the subscription does as much as it can, the local
+                       model finishes the queue. Nothing is billed either way.
+
+For -Executor auto, start llama-server first so the fallback actually exists.
+The runner warns if it is down and will simply stop early when Claude's window
+closes.
 
     powershell -ExecutionPolicy Bypass -File D:\ai\bin\start-server.ps1
 
@@ -144,12 +169,27 @@ Then, in a second window:
     # the real thing
     D:\ai\bin\night-run.ps1 -Root "D:\work\my-project"
 
+    # Claude only, on the bigger model, for a queue of harder tasks
+    D:\ai\bin\night-run.ps1 -Root "D:\work\my-project" -Executor claude -ClaudeModel opus
+
+    # local only - no network, nothing leaves the machine
+    D:\ai\bin\night-run.ps1 -Root "D:\work\my-project" -Executor opencode
+
 Options:
-    -TestCmd "php artisan test"   override the auto-detected test command
-    -TaskTimeoutMin 25            per-task hard timeout (default 20)
-    -MaxRetries 0                 no retry on failure (default 1)
-    -NoCommit                     run without committing (for trying it out)
-    -DryRun                       list the queue and exit
+    -Executor auto|claude|opencode   who writes the code (default auto)
+    -ClaudeModel sonnet|opus|haiku   model for the claude executor
+    -ClaudePermission acceptEdits    default. Auto-approves file edits; the
+                     |bypassPermissions   agent cannot run arbitrary shell
+                                     commands. bypassPermissions lets it run
+                                     anything - only for a repo you can throw
+                                     away. night-run runs the tests itself
+                                     either way, so acceptEdits is enough.
+    -OpenCodeModel local/gpt-oss-20b provider/model for the opencode executor
+    -TestCmd "php artisan test"      override the auto-detected test command
+    -TaskTimeoutMin 25               per-task hard timeout (default 20)
+    -MaxRetries 0                    no retry on failure (default 1)
+    -NoCommit                        no commits AND no rollback; trials only
+    -DryRun                          list the queue and exit
 
 Auto-detected test commands:
     artisan present      -> php artisan test
@@ -158,10 +198,11 @@ Auto-detected test commands:
     pyproject.toml       -> pytest -q
 
 PREFLIGHT REFUSALS - all of these are deliberate:
-    "not a git repository"       rollback is impossible without git
-    "working tree is dirty"      a rollback would destroy your own changes
+    "not a git repository"        rollback is impossible without git
+    "working tree is dirty"       a rollback would destroy your own changes
     "night-run is already active" the lock file; see section 7
-    "llama-server is not healthy" start the server first
+    "llama-server is not healthy" only when a local/ model is the ACTIVE
+                                  executor. A claude run does not need it.
 
 
 --------------------------------------------------------------------------------
@@ -245,13 +286,48 @@ THE MODEL WILL GAME THE TEST GATE  <-- the important one
 8. WHERE THIS FITS WITH CLAUDE
 --------------------------------------------------------------------------------
 
-Do not try to make the local model do everything. Split by what each is good at:
+Claude now sits on BOTH sides of this workflow, and the two jobs are different.
 
-    Claude (Max)      architecture, decomposing a feature into TASKS.md lines,
-                      reviewing what the night produced, unblocking [!] tasks
-    Local model       the mechanical grind: CRUD, migrations, form requests,
-                      boilerplate, translations, repetitive tests
+CLAUDE AS THE EXECUTOR (-Executor claude)
+    It runs the queue. This is the free path: the subscription is already
+    paid for, so an overnight run adds no cost. At ~30 s per task instead of
+    4-8 minutes, a 50-task queue finishes in under half an hour.
 
-The highest-value thing Claude does here is WRITE TASKS.md. A well-decomposed
-queue is worth more than any prompt tuning - it is the difference between 50
-green commits and 50 blocked tasks.
+    Which changes what "overnight" is for. The point stops being "run 8 hours
+    because it is slow" and becomes "run the queue, review it, fix the queue,
+    run it again" - several times a day. Use the night for the long tail, and
+    the afternoon for the loop you actually learn from.
+
+    The limit is your usage window, not money. When it closes, -Executor auto
+    hands the rest of the queue to the local model and the night continues.
+
+CLAUDE AS THE ARCHITECT (interactive, you and it, at the keyboard)
+    Decomposing a feature into TASKS.md lines, reviewing what the night
+    produced, unblocking [!] tasks. This is still the highest-value use, and
+    a faster executor makes it MORE important, not less:
+
+        the bottleneck is no longer tokens per second - it is how many
+        well-specified tasks you can write
+
+    At 30 s per task, an 8-hour night would need ~900 tasks. Nobody writes
+    900 good tasks. So the queue, not the model, is what caps your output.
+    A well-decomposed queue is worth more than any prompt tuning.
+
+WHAT THE LOCAL MODEL IS STILL FOR
+    - The fallback that keeps the night going after the usage window closes.
+    - Work that must not leave the machine. A client's codebase under an NDA
+      does not go to a free API tier, and free tiers are exactly where prompt
+      logging is the price of admission. Slow and private beats fast and
+      leaked, and that call is yours to make per project.
+    - Unlimited grinding: translations, fixtures, repetitive boilerplate,
+      where quality per task barely matters and you just want volume.
+
+ONE THING NO EXECUTOR FIXES
+    The test gate is what makes an unattended run safe, and it only grades
+    what a test can see. For a company website the things that matter most -
+    does the layout look right, is the copy correct, is it responsive, does
+    it look professional - are exactly what the suite does not check.
+
+    So: queue the backend overnight (migrations, models, requests, services,
+    API endpoints, their tests). Do the visual layer interactively, where you
+    can look at it. A green suite is not a good-looking site.
