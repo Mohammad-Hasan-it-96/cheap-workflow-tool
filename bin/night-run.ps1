@@ -15,19 +15,23 @@
                   strongest option. Bounded by your 5-hour / weekly usage
                   windows.
         opencode  opencode against any provider in opencode.json:
-                  local/gpt-oss-20b   llama.cpp on this machine, unlimited but
-                                      ~6 tok/s
                   openrouter/<model>  free tier: 50 requests/day, or 1000/day
-                                      once you have ever bought $10 of credit
+                                      once you have ever bought $10 of credit.
+                                      Needs OPENROUTER_API_KEY.
+                  local/gpt-oss-20b   llama.cpp on this machine. The local
+                                      stack was REMOVED on 2026-09-14 to
+                                      reclaim disk; rebuild it with
+                                      bin\install-llamacpp.ps1 plus a model
+                                      download if you ever want it back.
         auto      DEFAULT. Claude until its usage window is exhausted, then it
                   switches to opencode for the rest of the night instead of
-                  stopping. This is the free-overnight setup: the subscription
-                  does as much as it can, the local model finishes the queue.
+                  stopping: the subscription does as much as it can, the free
+                  tier finishes the queue.
 
     USAGE
         .\night-run.ps1 -Root "D:\work\my-project"
         .\night-run.ps1 -Root "D:\work\my-project" -Executor claude -ClaudeModel opus
-        .\night-run.ps1 -Root "D:\work\my-project" -Executor opencode -OpenCodeModel local/gpt-oss-20b
+        .\night-run.ps1 -Root "D:\work\my-project" -Executor opencode -OpenCodeModel openrouter/<model>
         .\night-run.ps1 -Root "D:\work\my-project" -DryRun     # plan only, no model, no writes
 #>
 [CmdletBinding()]
@@ -38,7 +42,7 @@ param(
     [string]$ClaudeModel      = "sonnet",
     [ValidateSet("acceptEdits","bypassPermissions")]
     [string]$ClaudePermission = "acceptEdits",
-    [string]$OpenCodeModel    = "local/gpt-oss-20b",
+    [string]$OpenCodeModel    = "openrouter/qwen/qwen3-coder:free",
     [string]$TestCmd          = "",                 # auto-detected when empty
     [string]$ServerUrl        = "http://127.0.0.1:8080",
     [int]   $TaskTimeoutMin   = 20,
@@ -320,27 +324,43 @@ try {
         Write-Log "opencode: $($script:OpenCodeExe) (model $OpenCodeModel)"
     }
 
-    # Only ping llama-server when a local model can actually be reached for.
-    # A claude-only run must not require a 13 GB server to be up.
-    $needsLocal = ($script:Active -eq "opencode" -or $script:Fallback -eq "opencode") -and
-                  ($OpenCodeModel -like "local/*")
-    if ($needsLocal) {
-        $healthy = $false
-        try {
-            $h = Invoke-RestMethod "$ServerUrl/health" -TimeoutSec 10
-            $healthy = ($h.status -eq "ok")
-        } catch { $healthy = $false }
+    # Check whatever the opencode executor actually needs - and only when it is
+    # reachable in this run. A claude-only run must not require any of it.
+    # Whichever backend it is, the rule is the same: HARD FAIL when opencode is
+    # driving, WARN when it is merely the safety net, because a warned-about
+    # missing fallback only costs you the tail of the night.
+    $usesOpenCode = ($script:Active -eq "opencode" -or $script:Fallback -eq "opencode")
+    if ($usesOpenCode) {
+        $problem = $null
 
-        if ($healthy) {
-            Write-Log "server  : ok at $ServerUrl"
-        } elseif ($script:Active -eq "opencode") {
-            throw "llama-server is not healthy at $ServerUrl. Start it with: D:\ai\bin\start-server.ps1"
-        } else {
-            # claude is driving; local is only the safety net. Warn, do not block.
-            Write-Log "WARNING: llama-server is DOWN at $ServerUrl." "Yellow"
+        if ($OpenCodeModel -like "local/*") {
+            # The local stack was removed on 2026-09-14. This branch survives so
+            # that rebuilding it (bin\install-llamacpp.ps1) just works again.
+            $healthy = $false
+            try {
+                $h = Invoke-RestMethod "$ServerUrl/health" -TimeoutSec 10
+                $healthy = ($h.status -eq "ok")
+            } catch { $healthy = $false }
+            if ($healthy) { Write-Log "backend : llama-server ok at $ServerUrl" }
+            else { $problem = "llama-server is not healthy at $ServerUrl. Start it with: D:\ai\bin\start-server.ps1" }
+        }
+        elseif ($OpenCodeModel -like "openrouter/*") {
+            if ([Environment]::GetEnvironmentVariable("OPENROUTER_API_KEY", "User") -or $env:OPENROUTER_API_KEY) {
+                Write-Log "backend : OPENROUTER_API_KEY is set"
+            } else {
+                $problem = "OPENROUTER_API_KEY is not set. Set it with:`n" +
+                           "  [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY','sk-or-...','User')`n" +
+                           "then open a NEW shell so it is visible."
+            }
+        }
+
+        if ($problem) {
+            if ($script:Active -eq "opencode") { throw $problem }
+            Write-Log "WARNING: the fallback executor is not usable." "Yellow"
+            foreach ($l in ($problem -split "`n")) { Write-Log "         $l" "Yellow" }
             Write-Log "         The run starts on claude, but when its usage window is" "Yellow"
             Write-Log "         exhausted there is nothing to fall back to and the night" "Yellow"
-            Write-Log "         will stop early. Start the server to cover the whole night." "Yellow"
+            Write-Log "         will stop early." "Yellow"
         }
     }
     $fbNote = ""

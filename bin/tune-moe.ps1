@@ -1,3 +1,4 @@
+# NOTE 2026-09-14: local stack removed; needs llama.cpp + a model to run.
 # tune-moe.ps1  -- rev2, uses llama-bench (purpose-built) instead of parsing llama-cli
 #
 # IMPORTANT: stop llama-server first. The sweep needs the whole 4 GB to itself.

@@ -4,6 +4,16 @@
   Written: 2026-09-06
 ================================================================================
 
+STATUS 2026-09-14: THE LOCAL STACK DESCRIBED HERE HAS BEEN REMOVED.
+The model, the llama.cpp binaries, the install zips and Ollama were all deleted
+to reclaim ~22 GB. Work now runs on Claude Code with an OpenRouter free-tier
+fallback - see D:\ai\workflow\README.txt.
+
+This guide is kept because it is the rebuild recipe and the record of what was
+actually measured on this machine. To bring the local stack back: run
+bin\install-llamacpp.ps1 (section 2), download a .gguf into D:\ai\models
+(section 5), then pass -OpenCodeModel local/<alias> to night-run.ps1.
+
 This file is English / LTR on purpose. Every command is copy-paste ready.
 Run everything in PowerShell (Windows PowerShell 5.1) unless stated otherwise.
 

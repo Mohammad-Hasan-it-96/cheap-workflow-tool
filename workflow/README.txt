@@ -1,4 +1,25 @@
 ================================================================================
+  CURRENT SETUP - as of 2026-09-14
+================================================================================
+
+  Executor       Claude Code headless, on the existing subscription.
+  Fallback       OpenRouter free tier via opencode, when the usage window
+                 closes. Needs OPENROUTER_API_KEY.
+  Local model    REMOVED. gpt-oss-20b, the llama.cpp binaries and the install
+                 zips were deleted on 2026-09-14 to reclaim ~22 GB. Ollama was
+                 uninstalled too - it had never had a model pulled into it.
+
+  Nothing runs on this machine any more, so the RAM and GPU notes below are
+  historical. They apply again only if you rebuild the local stack:
+
+      D:\ai\bin\install-llamacpp.ps1        re-downloads the binaries (~1 GB)
+      then download a .gguf into D:\ai\models and pass -OpenCodeModel local/...
+
+  Sections 1, 3 and 7 below describe that local setup and are kept as the
+  record of what was measured. Everything else applies as written.
+
+
+================================================================================
   OVERNIGHT WORKFLOW - local gpt-oss-20b + llama.cpp + opencode
   Measured on: Dell Precision 5550, i7-10750H (6c/12t), 32 GB, Quadro T2000 4 GB
 ================================================================================
@@ -141,27 +162,29 @@ WHO WRITES THE CODE - pick an executor
                        weekly usage windows, not by tokens you buy.
 
   -Executor opencode   opencode against whatever is in opencode.json:
-                         local/gpt-oss-20b   this machine. Unlimited, private,
-                                             ~6.2 tok/s, 4-8 min per task.
                          openrouter/<model>  free tier. 50 requests/day, or
                                              1000/day once you have ever
                                              bought $10 of credit. Below that
                                              threshold it dies in the first
                                              hour - see the install guide.
+                                             Needs OPENROUTER_API_KEY.
+                         local/gpt-oss-20b   REMOVED 2026-09-14. Rebuild with
+                                             install-llamacpp.ps1 + a model
+                                             download if you want it back.
 
   -Executor auto       DEFAULT. Claude until its usage window is exhausted,
                        then it switches to opencode for the rest of the night
-                       instead of stopping. THIS IS THE FREE OVERNIGHT SETUP:
-                       the subscription does as much as it can, the local
-                       model finishes the queue. Nothing is billed either way.
+                       instead of stopping: the subscription does as much as
+                       it can, the free tier finishes the queue. Nothing is
+                       billed either way.
 
-For -Executor auto, start llama-server first so the fallback actually exists.
-The runner warns if it is down and will simply stop early when Claude's window
-closes.
+For -Executor auto, set the OpenRouter key once so the fallback actually
+exists, then open a NEW shell. The runner warns if it is missing and will
+simply stop early when Claude's window closes.
 
-    powershell -ExecutionPolicy Bypass -File D:\ai\bin\start-server.ps1
+    [Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY","sk-or-...","User")
 
-Then, in a second window:
+Then:
 
     # always dry-run first - validates preflight, makes no model calls
     D:\ai\bin\night-run.ps1 -Root "D:\work\my-project" -DryRun
@@ -172,7 +195,7 @@ Then, in a second window:
     # Claude only, on the bigger model, for a queue of harder tasks
     D:\ai\bin\night-run.ps1 -Root "D:\work\my-project" -Executor claude -ClaudeModel opus
 
-    # local only - no network, nothing leaves the machine
+    # free tier only - no Claude usage consumed at all
     D:\ai\bin\night-run.ps1 -Root "D:\work\my-project" -Executor opencode
 
 Options:
@@ -184,7 +207,7 @@ Options:
                                      anything - only for a repo you can throw
                                      away. night-run runs the tests itself
                                      either way, so acceptEdits is enough.
-    -OpenCodeModel local/gpt-oss-20b provider/model for the opencode executor
+    -OpenCodeModel openrouter/...    provider/model for the opencode executor
     -TestCmd "php artisan test"      override the auto-detected test command
     -TaskTimeoutMin 25               per-task hard timeout (default 20)
     -MaxRetries 0                    no retry on failure (default 1)
@@ -203,6 +226,9 @@ PREFLIGHT REFUSALS - all of these are deliberate:
     "night-run is already active" the lock file; see section 7
     "llama-server is not healthy" only when a local/ model is the ACTIVE
                                   executor. A claude run does not need it.
+    "OPENROUTER_API_KEY is not set" only when an openrouter/ model is the
+                                  ACTIVE executor; a warning when it is just
+                                  the fallback.
 
 
 --------------------------------------------------------------------------------

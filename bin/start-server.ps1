@@ -1,4 +1,8 @@
 # start-server.ps1
+#
+# NOTE 2026-09-14: the local stack was removed to reclaim disk. This script
+# will throw "Model not found" until you re-run install-llamacpp.ps1 and
+# download a .gguf into D:\ai\models. Kept as the rebuild recipe.
 # Usage:  .\start-server.ps1                    -> safe defaults
 #         .\start-server.ps1 -NCpuMoe 18 -Ctx 65536
 param(

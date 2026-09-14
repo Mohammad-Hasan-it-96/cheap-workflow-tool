@@ -1,4 +1,7 @@
 # install-llamacpp.ps1
+#
+# This is the REBUILD entry point. The local stack was removed on 2026-09-14;
+# run this, then download a .gguf into D:\ai\models, to bring it back.
 # Downloads the newest llama.cpp Windows CUDA 12.4 build + CUDA runtime DLLs.
 $ErrorActionPreference = "Stop"
 
