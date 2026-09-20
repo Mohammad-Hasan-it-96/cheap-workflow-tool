@@ -68,8 +68,8 @@ way.
 ## Start
 
 ```powershell
-git clone https://github.com/Mohammad-Hasan-it-96/cheap-workfow-tool
-cd cheap-workfow-tool
+git clone https://github.com/Mohammad-Hasan-it-96/cheap-workflow-tool
+cd cheap-workflow-tool
 .\start-gui.bat
 ```
 
