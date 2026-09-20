@@ -1,0 +1,155 @@
+================================================================================
+  HOW TO RUN A NIGHT  -  the whole thing on one page
+  D:\ai   |   last verified 2026-09-20
+================================================================================
+
+THE FOUR COMMANDS
+-----------------
+
+    # ONCE per project
+    D:\ai\bin\new-project.ps1 -Root "D:\work\acme-site"
+
+    # EVERY time, before you trust it - no model calls, no writes
+    D:\ai\bin\night-run.ps1 -Root "D:\work\acme-site" -DryRun
+
+    # the run
+    D:\ai\bin\night-run.ps1 -Root "D:\work\acme-site"
+
+    # the morning after
+    cd D:\work\acme-site
+    git log --oneline
+    Select-String TASKS.md -Pattern '\[!\]'
+
+That is it. Everything below is detail on the one step that actually decides
+whether the night works.
+
+
+--------------------------------------------------------------------------------
+STEP 0 - THE PART THAT DECIDES EVERYTHING: WRITING TASKS.md
+--------------------------------------------------------------------------------
+
+The runner is plumbing. The queue is the work. A well-written queue with a
+weak model beats a vague queue with a strong one, every time.
+
+You do not have to write it by hand. Put your requirements in the project and
+ask Claude Code:
+
+    read REQUIREMENTS.md and write TASKS.md plus the tests
+
+That is the highest-value thing to use Claude for here. Keep that job; hand the
+mechanical typing to the free model.
+
+A task is the right size when it is:
+    * ONE file, or one file plus its test
+    * about 30 lines of code or fewer
+    * verifiable by the test suite alone, with no judgement call
+    * stated with EXACT names - path, class, method, column, route
+
+    TOO BIG - the model wanders, tests fail, you get [!]:
+        - [ ] Build the products module
+        - [ ] Add authentication
+
+    RIGHT SIZE:
+        - [ ] Create migration create_products_table with columns: id,
+              name string(255), price decimal(10,2), stock int default 0
+        - [ ] Create model app/Models/Product.php with fillable name, price, stock
+
+ORDER MATTERS. The runner commits after each task, so later tasks build on
+earlier ones. Migrations -> models -> requests -> controllers -> routes.
+
+NEVER PUT A TEST AND ITS IMPLEMENTATION IN THE SAME TASK. A task that can edit
+both can always make them agree. Write the tests yourself (or have Claude write
+them); the runner rejects any untagged task that modifies a test file.
+
+
+--------------------------------------------------------------------------------
+WHO WRITES THE CODE
+--------------------------------------------------------------------------------
+
+    -Executor auto       DEFAULT. claude -> opencode. Claude until its usage
+                         window closes, then free Gemini finishes the queue.
+    -Executor claude     subscription only. Strongest.
+    -Executor opencode   free only. google/gemini-3.5-flash-lite,
+                         1000 requests/day, about 200 tasks. Costs nothing.
+
+Useful flags:
+    -DryRun              list the queue and exit
+    -TaskTimeoutMin 25   per-task hard timeout (default 20)
+    -MaxRetries 0        no retry (default 1)
+    -ClaudeModel opus    for a queue of harder tasks
+    -TestCmd "php artisan test"      override the auto-detected test command
+
+Test command is auto-detected:
+    artisan -> php artisan test      pubspec.yaml -> flutter test
+    package.json + test -> npm test  pyproject.toml -> pytest -q
+
+
+--------------------------------------------------------------------------------
+READING THE MORNING
+--------------------------------------------------------------------------------
+
+    [x]  done, committed. The queue mark and the code are in the SAME commit.
+    [!]  blocked and rolled back. Nothing of it survives in the tree.
+
+A [!] is usually NOT the model being stupid. In order of likelihood:
+    1. the task was too big or ambiguous       -> split it, re-queue as [ ]
+    2. the test was wrong                      -> this happens; check it first
+    3. a rule AGENTS.md never actually stated  -> add the rule
+    4. the model genuinely failed              -> least common
+
+    Full transcript:   .agent\task-<stamp>-NNN.log
+    Test output:       the matching .tests file
+
+Re-queue a fixed task by changing [!] back to [ ].
+
+
+--------------------------------------------------------------------------------
+THINGS THAT WILL BITE YOU
+--------------------------------------------------------------------------------
+
+DIRTY TREE
+    Preflight refuses to start. That is deliberate: a rollback would destroy
+    your own uncommitted work. Commit or stash first.
+
+STALE LOCK after a hard kill
+    Remove-Item "D:\work\acme-site\.agent\night-run.lock"
+
+A GREEN SUITE IS NOT A GOOD-LOOKING SITE
+    The test gate grades what a test can see. For a company website the things
+    that matter most - layout, copy, responsiveness, whether it looks
+    professional - are exactly what the suite does not check. Queue the backend
+    overnight; do the visual layer interactively, where you can look at it.
+
+THE QUEUE, NOT THE MODEL, IS YOUR CEILING
+    A task takes 30-60 seconds now. An 8-hour night would need ~500 tasks and
+    nobody writes 500 good ones. So this is no longer really an overnight tool:
+    write a queue, run it, review it, fix the queue, run again - several times
+    a day. That loop teaches you more than any night ever did.
+
+LAPTOP ASLEEP for a genuinely long run
+    powercfg /change standby-timeout-ac 0
+    powercfg /change hibernate-timeout-ac 0
+
+
+--------------------------------------------------------------------------------
+IF SOMETHING IS NOT WORKING
+--------------------------------------------------------------------------------
+
+Run the demo. It is four pre-written tasks with a pre-written test gate, and it
+is known to pass 4/4 on the free tier:
+
+    D:\ai\bin\new-project.ps1 -Root "D:\work\starter-demo" -Starter
+    D:\ai\bin\night-run.ps1  -Root "D:\work\starter-demo" -Executor opencode
+
+If the demo passes, the setup is fine and the problem is in your queue.
+If the demo fails, the preflight line in the output names what is missing.
+
+DEAD ENDS - do not spend another evening on these:
+    Gemini CLI (`gemini`)   Google retired Sign-in-with-Google for individuals
+                            on 2026-06-18. It fails with "This client is no
+                            longer supported". The Gemini MODELS are still free
+                            through opencode; only that CLI's login died.
+    Aider                   same wall - it wanted a key, and the key was never
+                            the easy part.
+    Local gpt-oss-20b       removed 2026-09-14 to reclaim 22 GB. Rebuild with
+                            bin\install-llamacpp.ps1 plus a model download.
