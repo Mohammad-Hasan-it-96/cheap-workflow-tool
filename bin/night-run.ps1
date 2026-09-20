@@ -112,27 +112,69 @@ function Invoke-Git {
     } finally { $ErrorActionPreference = $prev }
 }
 
+# Find the real executable behind a command name.
+#
+# Get-Command WITHOUT -All returns whatever shadows the name first, and in a
+# shell with a user profile loaded that is often a FUNCTION or an ALIAS - whose
+# .Source is the empty string. Split-Path then dies with "Cannot bind argument
+# to parameter 'Path' because it is an empty string", which is what a real run
+# hit: `claude` is a function in this machine's PowerShell profile, so the
+# runner worked under -NoProfile and crashed in a normal shell.
+#
+# So: ask for ALL candidates and keep only ones that are actually on disk.
+function Resolve-CliTarget {
+    param([string]$Name, [string[]]$PreferNames)
+
+    $cands = @(Get-Command $Name -All -ErrorAction SilentlyContinue |
+               Where-Object { $_.Source })      # drops functions and aliases
+
+    # 1. a real executable we can hand to Start-Process
+    $app = $cands |
+           Where-Object { $_.CommandType -eq 'Application' -and $_.Source -match '\.(exe|cmd|bat)$' } |
+           Select-Object -First 1
+    if ($app) { return $app.Source }
+
+    # 2. a .ps1 shim - Start-Process cannot launch one, so take its sibling
+    $ps1 = $cands | Where-Object { $_.CommandType -eq 'ExternalScript' } | Select-Object -First 1
+    if ($ps1) {
+        $dir = Split-Path $ps1.Source -Parent
+        foreach ($n in $PreferNames) {
+            $c = Join-Path $dir $n
+            if (Test-Path $c) { return $c }
+        }
+    }
+
+    # 3. last resort: walk PATH ourselves
+    foreach ($d in ($env:PATH -split ';')) {
+        if (-not $d) { continue }
+        foreach ($n in $PreferNames) {
+            try {
+                $c = Join-Path $d $n
+                if (Test-Path $c) { return $c }
+            } catch { }   # a malformed PATH entry must not kill the run
+        }
+    }
+    return $null
+}
+
 function Resolve-OpenCodeExe {
-    $cmd = Get-Command opencode -ErrorAction SilentlyContinue
-    if (-not $cmd) { throw "opencode is not on PATH. Run: npm install -g opencode-ai" }
-    if ($cmd.Source -like "*.exe") { return $cmd.Source }
-    # npm / FlyEnv install a .ps1 shim; Start-Process needs the real .exe
-    $exe = Join-Path (Split-Path $cmd.Source -Parent) "node_modules\opencode-ai\bin\opencode.exe"
-    if (Test-Path $exe) { return $exe }
-    throw "Found shim '$($cmd.Source)' but no opencode.exe beside it."
+    # Prefer the bundled .exe: a .cmd would route through cmd.exe, and while the
+    # prompt now travels on stdin, a real exe keeps the remaining argv clean.
+    $cands = @(Get-Command opencode -All -ErrorAction SilentlyContinue | Where-Object { $_.Source })
+    foreach ($c in $cands) {
+        $dir = Split-Path $c.Source -Parent
+        $exe = Join-Path $dir "node_modules\opencode-ai\bin\opencode.exe"
+        if (Test-Path $exe) { return $exe }
+    }
+    $found = Resolve-CliTarget -Name "opencode" -PreferNames @("opencode.exe", "opencode.cmd")
+    if ($found) { return $found }
+    throw "Could not find an opencode executable. Run: npm install -g opencode-ai"
 }
 
 function Resolve-ClaudeExe {
-    $cmd = Get-Command claude -ErrorAction SilentlyContinue
-    if (-not $cmd) { throw "claude is not on PATH. Install Claude Code first." }
-    if ($cmd.Source -like "*.exe" -or $cmd.Source -like "*.cmd") { return $cmd.Source }
-    # Start-Process cannot launch a .ps1 shim; find the .cmd or .exe beside it
-    $dir = Split-Path $cmd.Source -Parent
-    foreach ($n in @("claude.exe", "claude.cmd")) {
-        $p = Join-Path $dir $n
-        if (Test-Path $p) { return $p }
-    }
-    throw "Found shim '$($cmd.Source)' but no claude.exe/.cmd beside it."
+    $found = Resolve-CliTarget -Name "claude" -PreferNames @("claude.exe", "claude.cmd")
+    if ($found) { return $found }
+    throw "Could not find a claude executable on PATH. Is Claude Code installed?"
 }
 
 # Returns the first test file the task modified, or $null.
@@ -353,18 +395,54 @@ New-Item -ItemType Directory -Force -Path $AgentDir | Out-Null
 $stamp          = Get-Date -Format "yyyyMMdd-HHmm"
 $script:LogFile = Join-Path $AgentDir "night-$stamp.log"
 
-# Single-instance lock. Two runners - or a runner plus a benchmark - will each
-# load a ~13 GB model and thrash a 32 GB machine into uselessness.
+# Single-instance lock, so two runners cannot fight over one working tree.
+#
+# The lock records the OWNING PROCESS ID, not just a timestamp. A lock file
+# alone cannot tell "a run is in progress" from "a run was killed": Ctrl+C, a
+# closed terminal or a truncated pipeline all skip the finally block and leave
+# the file behind. That used to mean the next night refused to start and the
+# queue sat untouched until someone deleted the file by hand - the opposite of
+# what an unattended runner is for. So an orphaned lock is now detected and
+# reclaimed; only a lock whose process is genuinely alive blocks the run.
 $lock = Join-Path $AgentDir "night-run.lock"
 if (Test-Path $lock) {
-    $owner = (Get-Content $lock -Raw).Trim()
-    throw "A night-run is already active (lock: $lock, started $owner). Delete the lock if it is stale."
+    $raw     = (Get-Content $lock -Raw -ErrorAction SilentlyContinue).Trim()
+    $ownerPid = $null
+    # \s* on both sides: Set-Content writes CRLF, and a bare $ will not match
+    # with the \r still sitting there - which silently made every stale lock
+    # look unparseable, and so un-reclaimable.
+    if ($raw -match '(?m)^\s*pid=(\d+)\s*$') { $ownerPid = [int]$Matches[1] }
+
+    $alive = $false
+    if ($ownerPid) {
+        $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+        # A recycled PID belonging to some unrelated program must not look like
+        # a live runner, so the name has to match too.
+        if ($proc -and $proc.ProcessName -match '(?i)powershell|pwsh') { $alive = $true }
+    } else {
+        # A lock from an older version has no pid line. Refuse, as before:
+        # guessing "it is probably stale" could start a second runner.
+        $alive = $true
+    }
+
+    if ($alive) {
+        throw "A night-run is already active (lock: $lock, owner pid $ownerPid). If you are sure it is dead, delete the lock."
+    }
+    Remove-Item $lock -Force -ErrorAction SilentlyContinue
+    $script:StaleLockPid = $ownerPid
 }
-Set-Content -Path $lock -Value (Get-Date -Format "s") -Encoding utf8
+Write-Lines -Path $lock -Lines @(
+    "pid=$PID"
+    "started=$(Get-Date -Format 's')"
+    "root=$Root"
+)
 
 try {
     Write-Log "=== NIGHT RUN START ===" "Cyan"
     Write-Log "root    : $Root"
+    if ($script:StaleLockPid) {
+        Write-Log "lock    : cleared a stale lock from dead pid $($script:StaleLockPid)" "Yellow"
+    }
 
     if (-not $TestCmd) { $TestCmd = Get-TestCommand -Dir $Root }
     if (-not $TestCmd) {
