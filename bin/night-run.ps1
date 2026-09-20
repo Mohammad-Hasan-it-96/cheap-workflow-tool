@@ -14,6 +14,10 @@
                   already pay for, so it adds no cost, and it is by far the
                   strongest option. Bounded by your 5-hour / weekly usage
                   windows.
+        gemini    Gemini CLI headless. FREE with a personal Google account -
+                  1000 requests/day, 60/min, no API key anywhere. (An API key
+                  gives you FEWER: 250/day. Just sign in.) One-time setup:
+                  run `gemini` once and pick "Login with Google".
         opencode  opencode against any provider in opencode.json:
                   openrouter/<model>  free tier: 50 requests/day, or 1000/day
                                       once you have ever bought $10 of credit.
@@ -23,10 +27,15 @@
                                       reclaim disk; rebuild it with
                                       bin\install-llamacpp.ps1 plus a model
                                       download if you ever want it back.
-        auto      DEFAULT. Claude until its usage window is exhausted, then it
-                  switches to opencode for the rest of the night instead of
-                  stopping: the subscription does as much as it can, the free
-                  tier finishes the queue.
+        auto      DEFAULT. Works down a CHAIN, moving to the next executor
+                  whenever the current one reports a usage limit:
+
+                      claude  ->  gemini  ->  opencode
+
+                  The subscription does as much as it can, Gemini's free
+                  1000/day takes over, OpenRouter's free tier mops up. None
+                  of it is billed. The night stops only when the whole chain
+                  is exhausted.
 
     USAGE
         .\night-run.ps1 -Root "D:\work\my-project"
@@ -37,11 +46,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Root,
-    [ValidateSet("auto","claude","opencode")]
+    [ValidateSet("auto","claude","gemini","opencode")]
     [string]$Executor         = "auto",
     [string]$ClaudeModel      = "sonnet",
     [ValidateSet("acceptEdits","bypassPermissions")]
     [string]$ClaudePermission = "acceptEdits",
+    [string]$GeminiModel      = "",                  # empty = the CLI's default
     [string]$OpenCodeModel    = "openrouter/qwen/qwen3-coder:free",
     [string]$TestCmd          = "",                 # auto-detected when empty
     [string]$ServerUrl        = "http://127.0.0.1:8080",
@@ -115,6 +125,21 @@ function Resolve-ClaudeExe {
     throw "Found shim '$($cmd.Source)' but no claude.exe/.cmd beside it."
 }
 
+# Gemini ships as a .ps1/.cmd shim around a bundled script. Resolve node.exe
+# plus that script and invoke it DIRECTLY: going through gemini.cmd would route
+# the prompt through cmd.exe, which mangles a multi-line argument containing
+# & | ^ or %. node.exe takes argv verbatim.
+function Resolve-GeminiParts {
+    $cmd = Get-Command gemini -ErrorAction SilentlyContinue
+    if (-not $cmd) { throw "gemini is not on PATH. Run: npm install -g @google/gemini-cli" }
+    $dir    = Split-Path $cmd.Source -Parent
+    $script = Join-Path $dir "node_modules\@google\gemini-cli\bundle\gemini.js"
+    if (-not (Test-Path $script)) { throw "Found gemini shim but no bundle at $script" }
+    $node = (Get-Command node -ErrorAction SilentlyContinue).Source
+    if (-not $node) { throw "node is not on PATH, but the gemini CLI needs it." }
+    return @{ Node = $node; Script = $script }
+}
+
 # Returns the first test file the task modified, or $null.
 #
 # WHY THIS EXISTS - observed, not hypothetical:
@@ -135,6 +160,50 @@ function Get-TouchedTestFile {
         foreach ($p in $patterns) { if ($f -match $p) { return $f } }
     }
     return $null
+}
+
+# Returns every queued task as { Text; LineNumber }, in file order, SKIPPING
+# anything inside an HTML comment.
+#
+# WHY: the TASKS.md templates document how to size a task by showing examples -
+#   <!--  WRONG - too big:
+#           - [ ] Build the products module
+#           - [ ] Add authentication  -->
+# A plain regex scan treats those as real work. Copy the shipped template into
+# a project, run the night, and the runner faithfully starts with "queued <-
+# the runner picks the first of these", then "Build the products module": the
+# exact vague tasks the template exists to warn you against. Comments are the
+# natural place to put examples, so the scanner has to understand them.
+function Get-QueuedTasks {
+    param([string]$Path)
+    $lines     = [IO.File]::ReadAllLines($Path)
+    $out       = @()
+    $inComment = $false
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        # Rebuild the line from only the parts OUTSIDE <!-- --> spans, so an
+        # inline comment can neither hide a real task nor reveal a fake one.
+        $visible = ""
+        $rest    = $lines[$i]
+        while ($true) {
+            if ($inComment) {
+                $close = $rest.IndexOf("-->")
+                if ($close -lt 0) { break }
+                $rest      = $rest.Substring($close + 3)
+                $inComment = $false
+            } else {
+                $open = $rest.IndexOf("<!--")
+                if ($open -lt 0) { $visible += $rest; break }
+                $visible  += $rest.Substring(0, $open)
+                $rest      = $rest.Substring($open + 4)
+                $inComment = $true
+            }
+        }
+        if ($visible -match '^\s*-\s*\[ \]\s+(.+)$') {
+            $out += [pscustomobject]@{ Text = $Matches[1].Trim(); LineNumber = $i + 1 }
+        }
+    }
+    return $out
 }
 
 function Get-TestCommand {
@@ -231,6 +300,21 @@ function Get-ExecutorInvocation {
             Label = "claude/$ClaudeModel"
         }
     }
+    if ($Kind -eq "gemini") {
+        # --skip-trust is REQUIRED headless: without it the CLI refuses to run
+        # in a directory it has not been trusted in interactively, and the run
+        # dies before the model is ever called.
+        $mode = if ($ClaudePermission -eq "bypassPermissions") { "yolo" } else { "auto_edit" }
+        $a = @($script:GeminiParts.Script, "--skip-trust", "--approval-mode", $mode)
+        if ($GeminiModel) { $a += @("-m", $GeminiModel) }
+        $a += @("-p", [IO.File]::ReadAllText($PromptFile))
+        return @{
+            File  = $script:GeminiParts.Node
+            Args  = $a
+            Stdin = $null                # node.exe takes argv verbatim
+            Label = "gemini$(if ($GeminiModel) { "/$GeminiModel" })"
+        }
+    }
     return @{
         File  = $script:OpenCodeExe
         Args  = @("run", "--auto", "--model", $OpenCodeModel,
@@ -311,67 +395,107 @@ try {
         Write-Log "         Use this to try the runner out, never for a real night." "Yellow"
     }
 
-    # --- executor setup -----------------------------------------------------
-    $script:Active   = if ($Executor -eq "auto") { "claude" } else { $Executor }
-    $script:Fallback = if ($Executor -eq "auto") { "opencode" } else { $null }
+    # --- executor chain -----------------------------------------------------
+    # auto walks down the chain, dropping to the next one each time the current
+    # executor reports a usage limit. Anything else is a chain of one.
+    $script:Chain = if ($Executor -eq "auto") { @("claude","gemini","opencode") } else { @($Executor) }
 
-    if ($script:Active -eq "claude" -or $script:Fallback -eq "claude") {
-        $script:ClaudeExe = Resolve-ClaudeExe
-        Write-Log "claude  : $($script:ClaudeExe) (model $ClaudeModel, $ClaudePermission)"
+    # Resolve every executable up front, so a broken PATH is a preflight error
+    # at 22:00 rather than a surprise at 03:00 when the chain drops to it.
+    # A fallback that will not resolve is dropped with a warning; only a broken
+    # ACTIVE executor is fatal.
+    $resolved = @()
+    foreach ($e in $script:Chain) {
+        try {
+            switch ($e) {
+                "claude" {
+                    $script:ClaudeExe = Resolve-ClaudeExe
+                    Write-Log "claude  : $($script:ClaudeExe) (model $ClaudeModel, $ClaudePermission)"
+                }
+                "gemini" {
+                    $script:GeminiParts = Resolve-GeminiParts
+                    $gm = if ($GeminiModel) { "model $GeminiModel" } else { "default model" }
+                    Write-Log "gemini  : $($script:GeminiParts.Script) ($gm)"
+                }
+                "opencode" {
+                    $script:OpenCodeExe = Resolve-OpenCodeExe
+                    Write-Log "opencode: $($script:OpenCodeExe) (model $OpenCodeModel)"
+                }
+            }
+            $resolved += $e
+        } catch {
+            if ($e -eq $script:Chain[0]) { throw }
+            Write-Log "NOTE   : dropping '$e' from the chain - $($_.Exception.Message)" "Yellow"
+        }
     }
-    if ($script:Active -eq "opencode" -or $script:Fallback -eq "opencode") {
-        $script:OpenCodeExe = Resolve-OpenCodeExe
-        Write-Log "opencode: $($script:OpenCodeExe) (model $OpenCodeModel)"
-    }
+    $script:Chain = $resolved
 
-    # Check whatever the opencode executor actually needs - and only when it is
-    # reachable in this run. A claude-only run must not require any of it.
-    # Whichever backend it is, the rule is the same: HARD FAIL when opencode is
-    # driving, WARN when it is merely the safety net, because a warned-about
-    # missing fallback only costs you the tail of the night.
-    $usesOpenCode = ($script:Active -eq "opencode" -or $script:Fallback -eq "opencode")
-    if ($usesOpenCode) {
+    # Backend credentials. Same rule for every executor: HARD FAIL when it is
+    # the ACTIVE one, WARN and drop it when it is only further down the chain,
+    # because a missing fallback costs you the tail of the night, not the night.
+    $keep = @()
+    foreach ($e in $script:Chain) {
         $problem = $null
 
-        if ($OpenCodeModel -like "local/*") {
-            # The local stack was removed on 2026-09-14. This branch survives so
-            # that rebuilding it (bin\install-llamacpp.ps1) just works again.
-            $healthy = $false
-            try {
-                $h = Invoke-RestMethod "$ServerUrl/health" -TimeoutSec 10
-                $healthy = ($h.status -eq "ok")
-            } catch { $healthy = $false }
-            if ($healthy) { Write-Log "backend : llama-server ok at $ServerUrl" }
-            else { $problem = "llama-server is not healthy at $ServerUrl. Start it with: D:\ai\bin\start-server.ps1" }
+        if ($e -eq "opencode") {
+            if ($OpenCodeModel -like "local/*") {
+                # The local stack was removed on 2026-09-14. This branch survives
+                # so that rebuilding it (bin\install-llamacpp.ps1) just works.
+                $healthy = $false
+                try {
+                    $h = Invoke-RestMethod "$ServerUrl/health" -TimeoutSec 10
+                    $healthy = ($h.status -eq "ok")
+                } catch { $healthy = $false }
+                if ($healthy) { Write-Log "backend : llama-server ok at $ServerUrl" }
+                else { $problem = "llama-server is not healthy at $ServerUrl. Start it with: D:\ai\bin\start-server.ps1" }
+            }
+            elseif ($OpenCodeModel -like "openrouter/*") {
+                if ([Environment]::GetEnvironmentVariable("OPENROUTER_API_KEY", "User") -or $env:OPENROUTER_API_KEY) {
+                    Write-Log "backend : OPENROUTER_API_KEY is set"
+                } else {
+                    $problem = "OPENROUTER_API_KEY is not set. Set it with:`n" +
+                               "  [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY','sk-or-...','User')`n" +
+                               "then open a NEW shell so it is visible."
+                }
+            }
         }
-        elseif ($OpenCodeModel -like "openrouter/*") {
-            if ([Environment]::GetEnvironmentVariable("OPENROUTER_API_KEY", "User") -or $env:OPENROUTER_API_KEY) {
-                Write-Log "backend : OPENROUTER_API_KEY is set"
-            } else {
-                $problem = "OPENROUTER_API_KEY is not set. Set it with:`n" +
-                           "  [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY','sk-or-...','User')`n" +
-                           "then open a NEW shell so it is visible."
+        elseif ($e -eq "gemini") {
+            # OAuth creds land here after `gemini` -> "Login with Google". No key
+            # is involved, and an API key would actually be WORSE: 250 req/day
+            # against 1000 for a signed-in Google account.
+            $credFile = Join-Path $env:USERPROFILE ".gemini\oauth_creds.json"
+            if (Test-Path $credFile) { Write-Log "backend : gemini is signed in (Google account)" }
+            else {
+                $problem = "gemini is not signed in. Run this ONCE, in a normal terminal:`n" +
+                           "  gemini`n" +
+                           "then choose 'Login with Google' and finish in the browser.`n" +
+                           "No API key is needed - signing in gives 1000 req/day, a key only 250."
             }
         }
 
-        if ($problem) {
-            if ($script:Active -eq "opencode") { throw $problem }
-            Write-Log "WARNING: the fallback executor is not usable." "Yellow"
-            foreach ($l in ($problem -split "`n")) { Write-Log "         $l" "Yellow" }
-            Write-Log "         The run starts on claude, but when its usage window is" "Yellow"
-            Write-Log "         exhausted there is nothing to fall back to and the night" "Yellow"
-            Write-Log "         will stop early." "Yellow"
+        if (-not $problem) { $keep += $e; continue }
+
+        if ($e -eq $script:Chain[0]) {
+            throw $problem
         }
+        Write-Log "NOTE   : dropping '$e' from the chain." "Yellow"
+        foreach ($l in ($problem -split "`n")) { Write-Log "         $l" "Yellow" }
     }
-    $fbNote = ""
-    if ($script:Fallback) { $fbNote = " (falls back to $($script:Fallback) on usage limit)" }
-    Write-Log "executor: $($script:Active)$fbNote"
+    $script:Chain  = $keep
+    $script:Active = $script:Chain[0]
+
+    $rest = @($script:Chain | Select-Object -Skip 1)
+    if ($rest.Count) {
+        Write-Log "executor: $($script:Active)  (then: $($rest -join ' -> '))"
+    } else {
+        Write-Log "executor: $($script:Active)  (no fallback - the night stops when this one is exhausted)" "Yellow"
+    }
 
     if ($DryRun) {
         Write-Log "--- DRY RUN: queued tasks ---" "Cyan"
-        Select-String -Path $TasksFile -Pattern '^\s*-\s*\[ \]\s+(.+)$' |
-            ForEach-Object { Write-Log ("  . " + $_.Matches[0].Groups[1].Value) }
-        Write-Log "--- no model calls, no writes ---" "Cyan"
+        $queued = @(Get-QueuedTasks -Path $TasksFile)
+        foreach ($q in $queued) { Write-Log ("  {0,4}. {1}" -f $q.LineNumber, $q.Text) }
+        Write-Log "--- $($queued.Count) task(s), no model calls, no writes ---" "Cyan"
         return
     }
 
@@ -379,11 +503,11 @@ try {
     $done = 0; $blocked = 0; $t0 = Get-Date
 
     while ($true) {
-        $hit = Select-String -Path $TasksFile -Pattern '^\s*-\s*\[ \]\s+(.+)$' | Select-Object -First 1
-        if (-not $hit) { Write-Log "=== QUEUE EMPTY ===" "Cyan"; break }
+        $next = @(Get-QueuedTasks -Path $TasksFile) | Select-Object -First 1
+        if (-not $next) { Write-Log "=== QUEUE EMPTY ===" "Cyan"; break }
 
-        $task   = $hit.Matches[0].Groups[1].Value.Trim()
-        $lineNo = $hit.LineNumber          # 1-based; used to edit the exact line
+        $task   = $next.Text
+        $lineNo = $next.LineNumber         # 1-based; used to edit the exact line
         Write-Log ""
         Write-Log "TASK: $task" "Cyan"
 
@@ -433,11 +557,12 @@ try {
                 # Out of quota, not out of ability. Switch executors and give
                 # the new one a full retry budget - this attempt does not count
                 # against the task, because the task was never really tried.
-                if ($script:Fallback -and (Test-UsageLimited -LogPath $outFile)) {
-                    Write-Log "  USAGE LIMIT on $($script:Active). Switching to $($script:Fallback) for the rest of the night." "Magenta"
-                    $script:Active   = $script:Fallback
-                    $script:Fallback = $null
-                    $maxAttempts     = $attempt + $MaxRetries + 1
+                if ($script:Chain.Count -gt 1 -and (Test-UsageLimited -LogPath $outFile)) {
+                    $spent = $script:Active
+                    $script:Chain  = @($script:Chain | Select-Object -Skip 1)
+                    $script:Active = $script:Chain[0]
+                    Write-Log "  USAGE LIMIT on $spent. Switching to $($script:Active) for the rest of the night." "Magenta"
+                    $maxAttempts   = $attempt + $MaxRetries + 1
                 }
                 continue
             }
