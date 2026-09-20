@@ -167,6 +167,19 @@ DIRTY TREE
     Preflight refuses to start. That is deliberate: a rollback would destroy
     your own uncommitted work. Commit or stash first.
 
+THE TEST COMMAND MUST ALREADY PASS
+    Preflight runs it once on a clean tree and refuses to start if it is red.
+    Every task is graded by that command, so a broken environment marks the
+    WHOLE queue [!] for a reason that has nothing to do with the model.
+    Before your first run on a project:
+        Laravel   composer install, and uncomment the sqlite lines in
+                  phpunit.xml so tests get a database:
+                      <env name="DB_CONNECTION" value="sqlite"/>
+                      <env name="DB_DATABASE" value=":memory:"/>
+        Node      npm install, and make sure `npm test` EXITS - bare `vitest`
+                  watches forever; use `vitest run`.
+    -SkipBaseline starts anyway, if you know why you want that.
+
 STALE LOCK after a hard kill
     Handled for you: the lock records its owning process id, so a lock left by
     a killed run is reclaimed automatically on the next start. Only a lock

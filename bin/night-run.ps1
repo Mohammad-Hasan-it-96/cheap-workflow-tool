@@ -69,6 +69,7 @@ param(
     [int]   $MaxRetries       = 1,
     [switch]$NoCommit,
     [switch]$AllowTestEdits,
+    [switch]$SkipBaseline,      # do not verify the test command before starting
     [switch]$DryRun
 )
 
@@ -553,6 +554,59 @@ try {
         Write-Log "executor: $($script:Active)  (then: $($rest -join ' -> '))"
     } else {
         Write-Log "executor: $($script:Active)  (no fallback - the night stops when this one is exhausted)" "Yellow"
+    }
+
+    # --- baseline: does the test command pass BEFORE any task runs? ---------
+    #
+    # Every task is graded by this command, so if it fails on a clean tree it
+    # will fail after task 1, task 2 and task 50 as well - and each will be
+    # rolled back and marked [!] as though the model wrote bad code. A whole
+    # queue can be burned that way on a missing vendor/ directory or a database
+    # that is not configured for tests.
+    #
+    # Observed, not hypothetical: a Laravel project with no vendor/ and the
+    # sqlite lines still commented out in phpunit.xml. The agent wrote a
+    # perfectly good test, then spent the task running composer install trying
+    # to make the gate work.
+    #
+    # So: run it once, here, and refuse to start if it is already red.
+    if ($TestCmd -and -not $SkipBaseline) {
+        Write-Log "baseline: running '$TestCmd' once to check the gate works..."
+        $baseOut = Join-Path $AgentDir ("baseline-{0}.log" -f $stamp)
+        $brc = Invoke-WithTimeout -FilePath "cmd.exe" -Arguments @("/c", $TestCmd) `
+                   -WorkDir $Root -TimeoutSec 900 -OutFile $baseOut
+
+        if ($brc -eq 0) {
+            Write-Log "baseline: tests pass on a clean tree" "Green"
+        } else {
+            $tail = ""
+            if (Test-Path $baseOut) {
+                $tail = (Get-Content $baseOut -Tail 15 -ErrorAction SilentlyContinue) -join "`n"
+            }
+            Write-Log "baseline: FAILED (exit $brc)" "Red"
+            throw @"
+The test command fails on a CLEAN tree, before any task has run.
+
+    command : $TestCmd
+    output  : $baseOut
+
+Every task is graded by this command, so starting now would mark the whole
+queue [!] for a reason that has nothing to do with the model. Fix the
+environment first. Common causes:
+
+  * dependencies not installed      composer install   /   npm install
+  * no test database configured     for Laravel, uncomment the sqlite lines
+                                    in phpunit.xml:
+                                      <env name="DB_CONNECTION" value="sqlite"/>
+                                      <env name="DB_DATABASE" value=":memory:"/>
+  * a test suite that was already red before you got here
+
+Last lines of the output:
+$tail
+
+Pass -SkipBaseline to start anyway.
+"@
+        }
     }
 
     if ($DryRun) {
