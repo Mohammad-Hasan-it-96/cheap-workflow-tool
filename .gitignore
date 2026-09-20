@@ -1,7 +1,13 @@
-# Big binaries and downloads - not source, 14 GB, re-downloadable
-models/
-llama.cpp/
-_tmp/
+# GUI local state: recent project list and per-machine settings
+gui/config.json
+__pycache__/
+*.pyc
 
-# Editor / runtime leftovers
+# Runner output inside a target project (never committed from here anyway)
+.agent/
+
+# Editor / OS noise
 *.bak
+.idea/
+.vscode/
+Thumbs.db

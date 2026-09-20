@@ -1,19 +1,40 @@
 ================================================================================
-  HOW TO RUN A NIGHT  -  the whole thing on one page
-  D:\ai   |   last verified 2026-09-20
+  HOW TO RUN A QUEUE  -  the whole thing on one page
+  Cheap Workflow Tool   |   last verified 2026-09-20
 ================================================================================
+
+THE GUI
+-------
+
+    start-gui.bat          (or: python gui\app.py)
+
+    Browse to a project  ->  Settings: Set up this project
+                         ->  Settings: Apply stack
+                         ->  Run: Dry run
+                         ->  Run: with CLAUDE / with GEMINI / AUTO
+
+    Every run opens in its OWN titled terminal window, so a Claude run and a
+    Gemini run are two separate things you can watch and kill independently.
+
+    The Tasks tab lists what the runner will actually pick up - it uses the
+    same comment-aware scan, so what you see is what will run.
+
+The GUI is only a front end. Everything below is the same thing by hand.
+
 
 THE FOUR COMMANDS
 -----------------
 
-    # ONCE per project
-    D:\ai\bin\new-project.ps1 -Root "D:\work\acme-site"
+    # ONCE per project - safe on a project you already have,
+    # it never overwrites a file that exists
+    .\bin\new-project.ps1 -Root "D:\work\acme-site"
 
     # EVERY time, before you trust it - no model calls, no writes
-    D:\ai\bin\night-run.ps1 -Root "D:\work\acme-site" -DryRun
+    .\bin\night-run.ps1 -Root "D:\work\acme-site" -DryRun
 
-    # the run
-    D:\ai\bin\night-run.ps1 -Root "D:\work\acme-site"
+    # the run  (-Executor opencode = free Gemini, claude = subscription,
+    #           auto = claude then Gemini)
+    .\bin\night-run.ps1 -Root "D:\work\acme-site" -Executor opencode
 
     # the morning after
     cd D:\work\acme-site
@@ -60,6 +81,30 @@ earlier ones. Migrations -> models -> requests -> controllers -> routes.
 NEVER PUT A TEST AND ITS IMPLEMENTATION IN THE SAME TASK. A task that can edit
 both can always make them agree. Write the tests yourself (or have Claude write
 them); the runner rejects any untagged task that modifies a test file.
+
+
+--------------------------------------------------------------------------------
+AGENTS.md AND STACK PRESETS
+--------------------------------------------------------------------------------
+
+AGENTS.md is the rules file, re-sent on EVERY model call. Keep it under ~150
+lines and write it for a model that does not infer:
+
+  IGNORED - abstract, nothing to pattern-match on:
+      "Write clean, maintainable code."   "Follow SOLID principles."
+
+  OBEYED - short, imperative, with a right/wrong pair:
+      "Never query inside a loop."
+          WRONG:  foreach ($orders as $o) { Customer::find($o->customer_id); }
+          RIGHT:  Order::with('customer')->get();
+
+Presets live in workflow\templates\stacks\ - Laravel + React,
+Node + Prisma + React, Flutter, Generic. Apply one from the GUI's Settings tab,
+or copy the file to AGENTS.md by hand.
+
+AFTER APPLYING ONE, OPEN IT. Replace the example versions and commands with
+this project's real ones. The model has no other source for them, and a wrong
+command in AGENTS.md is worse than none.
 
 
 --------------------------------------------------------------------------------
@@ -112,7 +157,10 @@ DIRTY TREE
     your own uncommitted work. Commit or stash first.
 
 STALE LOCK after a hard kill
-    Remove-Item "D:\work\acme-site\.agent\night-run.lock"
+    Handled for you: the lock records its owning process id, so a lock left by
+    a killed run is reclaimed automatically on the next start. Only a lock
+    whose process is genuinely alive blocks a run. The GUI has a Clear stale
+    lock button for the rare leftover from an older version.
 
 A GREEN SUITE IS NOT A GOOD-LOOKING SITE
     The test gate grades what a test can see. For a company website the things
@@ -138,8 +186,8 @@ IF SOMETHING IS NOT WORKING
 Run the demo. It is four pre-written tasks with a pre-written test gate, and it
 is known to pass 4/4 on the free tier:
 
-    D:\ai\bin\new-project.ps1 -Root "D:\work\starter-demo" -Starter
-    D:\ai\bin\night-run.ps1  -Root "D:\work\starter-demo" -Executor opencode
+    .\bin\new-project.ps1 -Root "D:\work\starter-demo" -Starter
+    .\bin\night-run.ps1  -Root "D:\work\starter-demo" -Executor opencode
 
 If the demo passes, the setup is fine and the problem is in your queue.
 If the demo fails, the preflight line in the output names what is missing.
@@ -151,5 +199,7 @@ DEAD ENDS - do not spend another evening on these:
                             through opencode; only that CLI's login died.
     Aider                   same wall - it wanted a key, and the key was never
                             the easy part.
-    Local gpt-oss-20b       removed 2026-09-14 to reclaim 22 GB. Rebuild with
-                            bin\install-llamacpp.ps1 plus a model download.
+    Local gpt-oss-20b       removed. A 20B model on a 4 GB GPU ran at about
+                            6 tok/s - 4-8 minutes per task against 30-60
+                            seconds on a free hosted model. The scripts for it
+                            are in this repo's git history if you want them.
