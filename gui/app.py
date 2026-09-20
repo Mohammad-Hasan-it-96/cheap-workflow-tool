@@ -27,6 +27,7 @@ BIN_DIR = ROOT_DIR / "bin"
 NIGHT_RUN = BIN_DIR / "night-run.ps1"
 NEW_PROJECT = BIN_DIR / "new-project.ps1"
 STACKS_DIR = ROOT_DIR / "workflow" / "templates" / "stacks"
+PROMPTS_DIR = ROOT_DIR / "workflow" / "prompts"
 CONFIG_PATH = ROOT_DIR / "gui" / "config.json"
 
 # Windows only: give each run its own console window.
@@ -231,8 +232,10 @@ class App(tk.Tk):
         ttk.Button(btns, text="Open AGENTS.md", command=self.open_agents).pack(side="left", padx=4)
         ttk.Button(btns, text="Re-queue selected  [!] -> [ ]",
                    command=self.requeue_selected).pack(side="left", padx=4)
-        ttk.Button(btns, text="Write tasks with Claude",
-                   command=self.plan_with_claude).pack(side="left", padx=4)
+        ttk.Button(btns, text="Write tasks with Claude...",
+                   command=self.prompt_write_tasks).pack(side="left", padx=4)
+        ttk.Button(btns, text="Fix blocked tasks...",
+                   command=self.prompt_unblock).pack(side="left", padx=4)
 
     def _build_run_tab(self, nb):
         f = ttk.Frame(nb, padding=12)
@@ -468,18 +471,53 @@ class App(tk.Tk):
         self.say(f"Re-queued {changed} task(s).")
         self.refresh()
 
-    def plan_with_claude(self):
+    def _guess_source(self, p):
+        """Best guess at where this project's requirements live."""
+        for name in ("docs", "requirements", "spec", "REQUIREMENTS.md",
+                     "PROJECT.md", "README.md"):
+            if (p / name).exists():
+                return name
+        return "README.md"
+
+    def _load_prompt(self, filename, **subs):
+        f = PROMPTS_DIR / filename
+        if not f.exists():
+            return f"(missing prompt template: {f})"
+        text = f.read_text(encoding="utf-8")
+        for k, v in subs.items():
+            text = text.replace("{" + k + "}", str(v))
+        return text
+
+    def prompt_write_tasks(self):
         p = self.need_project()
         if not p:
             return
-        run_in_new_terminal(
-            "PLAN - write TASKS.md with Claude",
-            "Write-Host 'Ask Claude for a queue, for example:' -ForegroundColor Cyan; "
-            "Write-Host '  read docs/ and write TASKS.md for the next feature, plus the tests' "
-            "-ForegroundColor Gray; Write-Host ''; claude",
-            cwd=p,
+        PromptDialog(
+            self, p,
+            title="Write tasks with Claude",
+            template="write-tasks.md",
+            show_source=True,
+            source_default=self._guess_source(p),
+            count_default="8",
         )
-        self.say("Opened a Claude session for planning.")
+
+    def prompt_unblock(self):
+        p = self.need_project()
+        if not p:
+            return
+        blocked = sum(1 for _, m, _ in parse_tasks(p / "TASKS.md") if m == "!")
+        if blocked == 0:
+            if not messagebox.askyesno(
+                APP_NAME,
+                "No blocked tasks in this queue.\n\nOpen the prompt anyway?"
+            ):
+                return
+        PromptDialog(
+            self, p,
+            title="Fix blocked tasks",
+            template="unblock.md",
+            show_source=False,
+        )
 
     # ------------------------------------------------------------------ runs
     def _night_run_cmd(self, executor=None, dry=False):
@@ -625,6 +663,150 @@ class App(tk.Tk):
             "Write-Host ''; Write-Host 'Free Gemini key (no card): https://aistudio.google.com/apikey' "
             "-ForegroundColor Yellow",
         )
+
+
+class PromptDialog(tk.Toplevel):
+    """Shows a ready prompt, lets you edit it, and puts it on the clipboard.
+
+    This exists because "open a Claude session in the project" is only half a
+    feature: the session opens and you still have to know what to say. The
+    prompt IS the work here - it carries the task-sizing rules that decide
+    whether a queue runs cleanly - so it ships as editable text rather than
+    living in someone's head.
+
+    The prompt travels by clipboard rather than as a command-line argument on
+    purpose: it is long and multi-line, and passing that through PowerShell to
+    a .cmd shim mangles quotes and newlines. Paste is boring and it works.
+    """
+
+    def __init__(self, parent, project, title, template, show_source=False,
+                 source_default="", count_default="8"):
+        super().__init__(parent)
+        self.parent = parent
+        self.project = project
+        self.template = template
+        self.title(title)
+        self.geometry("880x620")
+        self.minsize(700, 480)
+        self.transient(parent)
+
+        self.source_var = tk.StringVar(value=source_default)
+        self.count_var = tk.StringVar(value=count_default)
+        self.show_source = show_source
+
+        if show_source:
+            top = ttk.LabelFrame(self, text="What should Claude read?", padding=10)
+            top.pack(fill="x", padx=10, pady=(10, 4))
+            ttk.Label(top, text="Source").grid(row=0, column=0, sticky="w")
+            ttk.Entry(top, textvariable=self.source_var, width=46).grid(
+                row=0, column=1, sticky="w", padx=6)
+            ttk.Button(top, text="Pick file...", command=self.pick_file).grid(
+                row=0, column=2, padx=2)
+            ttk.Button(top, text="Pick folder...", command=self.pick_folder).grid(
+                row=0, column=3, padx=2)
+            ttk.Label(top, text="How many tasks").grid(row=1, column=0, sticky="w", pady=(6, 0))
+            ttk.Entry(top, textvariable=self.count_var, width=8).grid(
+                row=1, column=1, sticky="w", padx=6, pady=(6, 0))
+            ttk.Button(top, text="Rebuild prompt", command=self.rebuild).grid(
+                row=1, column=2, sticky="w", pady=(6, 0))
+
+        ttk.Label(
+            self,
+            text="Edit freely, then copy. Paste into the Claude session with Ctrl+V.",
+            foreground="#555",
+        ).pack(anchor="w", padx=12, pady=(6, 2))
+
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True, padx=10)
+        self.text = tk.Text(wrap, wrap="word", height=20, undo=True,
+                            font=("Consolas", 10))
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+        btns = ttk.Frame(self, padding=10)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Copy to clipboard", command=self.copy).pack(side="left")
+        ttk.Button(btns, text="Copy and open Claude here",
+                   command=self.copy_and_open).pack(side="left", padx=6)
+        ttk.Button(btns, text="Save as .md in project",
+                   command=self.save_to_project).pack(side="left")
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+        self.status = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.status, foreground="#127a2b").pack(
+            anchor="w", padx=12, pady=(0, 8))
+
+        self.rebuild()
+        self.text.focus_set()
+
+    # ---------------------------------------------------------------- source
+    def _relative(self, chosen):
+        """Show a path relative to the project when it is inside it."""
+        try:
+            return str(Path(chosen).resolve().relative_to(self.project.resolve()))
+        except ValueError:
+            return chosen
+
+    def pick_file(self):
+        f = filedialog.askopenfilename(title="Requirements file",
+                                       initialdir=str(self.project))
+        if f:
+            self.source_var.set(self._relative(f))
+            self.rebuild()
+
+    def pick_folder(self):
+        d = filedialog.askdirectory(title="Requirements folder",
+                                    initialdir=str(self.project))
+        if d:
+            self.source_var.set(self._relative(d))
+            self.rebuild()
+
+    # --------------------------------------------------------------- content
+    def rebuild(self):
+        body = self.parent._load_prompt(
+            self.template,
+            SOURCE=self.source_var.get() or "the requirements in this project",
+            COUNT=self.count_var.get() or "8",
+        )
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", body)
+        self.status.set("")
+
+    def current(self):
+        return self.text.get("1.0", "end-1c")
+
+    # --------------------------------------------------------------- actions
+    def copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.current())
+        self.update()          # make the clipboard survive this window closing
+        self.status.set("Copied. Paste it into Claude with Ctrl+V.")
+
+    def copy_and_open(self):
+        self.copy()
+        run_in_new_terminal(
+            f"CLAUDE - plan - {self.project.name}",
+            "Write-Host 'The prompt is on your clipboard.' -ForegroundColor Green; "
+            "Write-Host 'Paste it into Claude with Ctrl+V, then press Enter.' "
+            "-ForegroundColor Gray; "
+            "Write-Host 'This session only writes TASKS.md - it does not run tasks.' "
+            "-ForegroundColor DarkGray; Write-Host ''; claude",
+            cwd=self.project,
+        )
+        self.status.set("Claude opened. Paste with Ctrl+V.")
+
+    def save_to_project(self):
+        out = self.project / ".agent" / f"prompt-{self.template}"
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with open(out, "w", encoding="utf-8", newline="") as fh:
+                fh.write(self.current())
+            self.status.set(f"Saved to {out}")
+        except OSError as e:
+            messagebox.showerror(APP_NAME, str(e))
+
 
 
 def main():

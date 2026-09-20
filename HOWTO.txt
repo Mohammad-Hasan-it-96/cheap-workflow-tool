@@ -52,13 +52,24 @@ STEP 0 - THE PART THAT DECIDES EVERYTHING: WRITING TASKS.md
 The runner is plumbing. The queue is the work. A well-written queue with a
 weak model beats a vague queue with a strong one, every time.
 
-You do not have to write it by hand. Put your requirements in the project and
-ask Claude Code:
+You do not have to write it by hand, and you should not have to remember what
+to type either. In the GUI:
 
-    read REQUIREMENTS.md and write TASKS.md plus the tests
+    Tasks tab -> "Write tasks with Claude..."
+        pick what Claude should read, choose how many tasks,
+        then "Copy and open Claude here" and paste with Ctrl+V
 
-That is the highest-value thing to use Claude for here. Keep that job; hand the
-mechanical typing to the free model.
+    Tasks tab -> "Fix blocked tasks..."
+        the same thing for the morning review of [!] tasks
+
+The prompts live in workflow\prompts\ as plain markdown - write-tasks.md and
+unblock.md. Edit them once and every project gets the improvement. They carry
+the task-sizing rules, the append-never-overwrite rule, and the
+test/implementation split, which is why they are worth more than a sentence
+typed from memory.
+
+Writing the queue is the highest-value thing to use Claude for here. Keep that
+job; hand the mechanical typing to the free model.
 
 A task is the right size when it is:
     * ONE file, or one file plus its test

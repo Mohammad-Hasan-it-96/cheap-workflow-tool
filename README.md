@@ -109,12 +109,16 @@ RIGHT SIZE
   - [ ] Create model app/Models/Product.php with fillable name, price, stock
 ```
 
-You do not have to write it by hand. Put your requirements in the project and
-ask Claude — the GUI has a **Write tasks with Claude** button for exactly this:
+You do not have to write it by hand. The GUI's **Tasks → Write tasks with
+Claude...** button opens a ready prompt: pick what Claude should read, choose
+how many tasks, edit it if you like, then **Copy and open Claude here** and
+paste with Ctrl+V.
 
-```
-read docs/ and write TASKS.md for the next feature, plus the tests
-```
+The prompt is the real artifact — it carries the sizing rules, the
+append-don't-overwrite rule, and the test/implementation split. It lives in
+`workflow/prompts/write-tasks.md`, so you can edit it once and have every
+project benefit. There is a second one, `unblock.md`, behind **Fix blocked
+tasks...** for the morning review.
 
 **Never put a test and its implementation in the same task.** A task that can
 edit both can always make them agree. Write the tests yourself, or have Claude
