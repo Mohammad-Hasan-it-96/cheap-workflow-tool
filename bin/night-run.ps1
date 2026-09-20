@@ -14,45 +14,55 @@
                   already pay for, so it adds no cost, and it is by far the
                   strongest option. Bounded by your 5-hour / weekly usage
                   windows.
-        gemini    Gemini CLI headless. FREE with a personal Google account -
-                  1000 requests/day, 60/min, no API key anywhere. (An API key
-                  gives you FEWER: 250/day. Just sign in.) One-time setup:
-                  run `gemini` once and pick "Login with Google".
         opencode  opencode against any provider in opencode.json:
-                  openrouter/<model>  free tier: 50 requests/day, or 1000/day
-                                      once you have ever bought $10 of credit.
+                  google/gemini-2.5-flash-lite
+                                      DEFAULT FREE TIER. 1000 requests/day,
+                                      15/min, 1M context, tool calling. Needs
+                                      GEMINI_API_KEY - free from
+                                      https://aistudio.google.com/apikey with
+                                      no credit card. google/gemini-2.5-flash
+                                      is stronger but only 250/day.
+                  openrouter/<model>  50 requests/day, or 1000/day once you
+                                      have ever bought $10 of credit.
                                       Needs OPENROUTER_API_KEY.
                   local/gpt-oss-20b   llama.cpp on this machine. The local
                                       stack was REMOVED on 2026-09-14 to
                                       reclaim disk; rebuild it with
                                       bin\install-llamacpp.ps1 plus a model
                                       download if you ever want it back.
+
+    NOT AVAILABLE: the Gemini CLI (`gemini`) executor was removed on
+    2026-09-20. Google retired "Gemini Code Assist for individuals" on
+    2026-06-18, so its free Sign-in-with-Google path now fails outright with
+    "This client is no longer supported". Google's replacement is the
+    Antigravity CLI (`agy`, https://antigravity.google) - free tier, OAuth,
+    no key - but it is a separate install that is not verified on this
+    machine. The Gemini MODELS are still reachable and still free through
+    opencode above; only that one CLI's login died.
         auto      DEFAULT. Works down a CHAIN, moving to the next executor
                   whenever the current one reports a usage limit:
 
-                      claude  ->  gemini  ->  opencode
+                      claude  ->  opencode
 
-                  The subscription does as much as it can, Gemini's free
-                  1000/day takes over, OpenRouter's free tier mops up. None
-                  of it is billed. The night stops only when the whole chain
-                  is exhausted.
+                  The subscription does as much as it can, then Gemini's free
+                  1000/day finishes the queue. Neither is billed. The night
+                  stops only when the whole chain is exhausted.
 
     USAGE
         .\night-run.ps1 -Root "D:\work\my-project"
         .\night-run.ps1 -Root "D:\work\my-project" -Executor claude -ClaudeModel opus
-        .\night-run.ps1 -Root "D:\work\my-project" -Executor opencode -OpenCodeModel openrouter/<model>
+        .\night-run.ps1 -Root "D:\work\my-project" -Executor opencode   # free Gemini
         .\night-run.ps1 -Root "D:\work\my-project" -DryRun     # plan only, no model, no writes
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Root,
-    [ValidateSet("auto","claude","gemini","opencode")]
+    [ValidateSet("auto","claude","opencode")]
     [string]$Executor         = "auto",
     [string]$ClaudeModel      = "sonnet",
     [ValidateSet("acceptEdits","bypassPermissions")]
     [string]$ClaudePermission = "acceptEdits",
-    [string]$GeminiModel      = "",                  # empty = the CLI's default
-    [string]$OpenCodeModel    = "openrouter/qwen/qwen3-coder:free",
+    [string]$OpenCodeModel    = "google/gemini-2.5-flash-lite",
     [string]$TestCmd          = "",                 # auto-detected when empty
     [string]$ServerUrl        = "http://127.0.0.1:8080",
     [int]   $TaskTimeoutMin   = 20,
@@ -123,21 +133,6 @@ function Resolve-ClaudeExe {
         if (Test-Path $p) { return $p }
     }
     throw "Found shim '$($cmd.Source)' but no claude.exe/.cmd beside it."
-}
-
-# Gemini ships as a .ps1/.cmd shim around a bundled script. Resolve node.exe
-# plus that script and invoke it DIRECTLY: going through gemini.cmd would route
-# the prompt through cmd.exe, which mangles a multi-line argument containing
-# & | ^ or %. node.exe takes argv verbatim.
-function Resolve-GeminiParts {
-    $cmd = Get-Command gemini -ErrorAction SilentlyContinue
-    if (-not $cmd) { throw "gemini is not on PATH. Run: npm install -g @google/gemini-cli" }
-    $dir    = Split-Path $cmd.Source -Parent
-    $script = Join-Path $dir "node_modules\@google\gemini-cli\bundle\gemini.js"
-    if (-not (Test-Path $script)) { throw "Found gemini shim but no bundle at $script" }
-    $node = (Get-Command node -ErrorAction SilentlyContinue).Source
-    if (-not $node) { throw "node is not on PATH, but the gemini CLI needs it." }
-    return @{ Node = $node; Script = $script }
 }
 
 # Returns the first test file the task modified, or $null.
@@ -300,21 +295,6 @@ function Get-ExecutorInvocation {
             Label = "claude/$ClaudeModel"
         }
     }
-    if ($Kind -eq "gemini") {
-        # --skip-trust is REQUIRED headless: without it the CLI refuses to run
-        # in a directory it has not been trusted in interactively, and the run
-        # dies before the model is ever called.
-        $mode = if ($ClaudePermission -eq "bypassPermissions") { "yolo" } else { "auto_edit" }
-        $a = @($script:GeminiParts.Script, "--skip-trust", "--approval-mode", $mode)
-        if ($GeminiModel) { $a += @("-m", $GeminiModel) }
-        $a += @("-p", [IO.File]::ReadAllText($PromptFile))
-        return @{
-            File  = $script:GeminiParts.Node
-            Args  = $a
-            Stdin = $null                # node.exe takes argv verbatim
-            Label = "gemini$(if ($GeminiModel) { "/$GeminiModel" })"
-        }
-    }
     return @{
         File  = $script:OpenCodeExe
         Args  = @("run", "--auto", "--model", $OpenCodeModel,
@@ -398,7 +378,7 @@ try {
     # --- executor chain -----------------------------------------------------
     # auto walks down the chain, dropping to the next one each time the current
     # executor reports a usage limit. Anything else is a chain of one.
-    $script:Chain = if ($Executor -eq "auto") { @("claude","gemini","opencode") } else { @($Executor) }
+    $script:Chain = if ($Executor -eq "auto") { @("claude","opencode") } else { @($Executor) }
 
     # Resolve every executable up front, so a broken PATH is a preflight error
     # at 22:00 rather than a surprise at 03:00 when the chain drops to it.
@@ -411,11 +391,6 @@ try {
                 "claude" {
                     $script:ClaudeExe = Resolve-ClaudeExe
                     Write-Log "claude  : $($script:ClaudeExe) (model $ClaudeModel, $ClaudePermission)"
-                }
-                "gemini" {
-                    $script:GeminiParts = Resolve-GeminiParts
-                    $gm = if ($GeminiModel) { "model $GeminiModel" } else { "default model" }
-                    Write-Log "gemini  : $($script:GeminiParts.Script) ($gm)"
                 }
                 "opencode" {
                     $script:OpenCodeExe = Resolve-OpenCodeExe
@@ -449,6 +424,24 @@ try {
                 if ($healthy) { Write-Log "backend : llama-server ok at $ServerUrl" }
                 else { $problem = "llama-server is not healthy at $ServerUrl. Start it with: D:\ai\bin\start-server.ps1" }
             }
+            elseif ($OpenCodeModel -like "google/*") {
+                # opencode accepts any of these three for the google provider.
+                $names = @("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY")
+                $found = $null
+                foreach ($n in $names) {
+                    if ([Environment]::GetEnvironmentVariable($n, "User") -or
+                        [Environment]::GetEnvironmentVariable($n, "Process")) { $found = $n; break }
+                }
+                if ($found) { Write-Log "backend : $found is set (google provider)" }
+                else {
+                    $problem = "No Gemini API key found. Get one FREE - no credit card:`n" +
+                               "  1. open https://aistudio.google.com/apikey`n" +
+                               "  2. sign in and click 'Create API key'`n" +
+                               "  3. run, then open a NEW shell:`n" +
+                               "     [Environment]::SetEnvironmentVariable('GEMINI_API_KEY','<paste>','User')`n" +
+                               "gemini-2.5-flash-lite is then 1000 requests/day at no cost."
+                }
+            }
             elseif ($OpenCodeModel -like "openrouter/*") {
                 if ([Environment]::GetEnvironmentVariable("OPENROUTER_API_KEY", "User") -or $env:OPENROUTER_API_KEY) {
                     Write-Log "backend : OPENROUTER_API_KEY is set"
@@ -457,19 +450,6 @@ try {
                                "  [Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY','sk-or-...','User')`n" +
                                "then open a NEW shell so it is visible."
                 }
-            }
-        }
-        elseif ($e -eq "gemini") {
-            # OAuth creds land here after `gemini` -> "Login with Google". No key
-            # is involved, and an API key would actually be WORSE: 250 req/day
-            # against 1000 for a signed-in Google account.
-            $credFile = Join-Path $env:USERPROFILE ".gemini\oauth_creds.json"
-            if (Test-Path $credFile) { Write-Log "backend : gemini is signed in (Google account)" }
-            else {
-                $problem = "gemini is not signed in. Run this ONCE, in a normal terminal:`n" +
-                           "  gemini`n" +
-                           "then choose 'Login with Google' and finish in the browser.`n" +
-                           "No API key is needed - signing in gives 1000 req/day, a key only 250."
             }
         }
 

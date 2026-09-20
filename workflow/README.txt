@@ -3,8 +3,19 @@
 ================================================================================
 
   Executor       Claude Code headless, on the existing subscription.
-  Fallback       OpenRouter free tier via opencode, when the usage window
-                 closes. Needs OPENROUTER_API_KEY.
+  Fallback       Gemini via opencode - google/gemini-2.5-flash-lite, 1000
+                 requests/day free. Needs GEMINI_API_KEY, free and with no
+                 credit card from https://aistudio.google.com/apikey.
+
+  DEAD ENDS, so you do not lose an evening rediscovering them:
+    Gemini CLI (`gemini`)  Google retired "Gemini Code Assist for
+                 individuals" on 2026-06-18. Sign-in-with-Google now fails
+                 with "This client is no longer supported". The replacement
+                 is the Antigravity CLI (`agy`, https://antigravity.google):
+                 free tier, OAuth, no key - but a separate install, and not
+                 verified here. The Gemini MODELS are still free through
+                 opencode; only that CLI's login died.
+    Aider        same wall: it wanted a key that was never the easy part.
   Local model    REMOVED. gpt-oss-20b, the llama.cpp binaries and the install
                  zips were deleted on 2026-09-14 to reclaim ~22 GB. Ollama was
                  uninstalled too - it had never had a model pulled into it.
@@ -162,12 +173,16 @@ WHO WRITES THE CODE - pick an executor
                        weekly usage windows, not by tokens you buy.
 
   -Executor opencode   opencode against whatever is in opencode.json:
-                         openrouter/<model>  free tier. 50 requests/day, or
-                                             1000/day once you have ever
-                                             bought $10 of credit. Below that
-                                             threshold it dies in the first
-                                             hour - see the install guide.
-                                             Needs OPENROUTER_API_KEY.
+                         google/gemini-2.5-flash-lite   THE FREE ONE.
+                                             1000 requests/day, 15/min, 1M
+                                             context, tool calling. About 200
+                                             tasks a day at ~5 calls each.
+                                             google/gemini-2.5-flash is
+                                             stronger but only 250/day.
+                                             Needs GEMINI_API_KEY.
+                         openrouter/<model>  50 requests/day, or 1000/day
+                                             once you have ever bought $10 of
+                                             credit. Needs OPENROUTER_API_KEY.
                          local/gpt-oss-20b   REMOVED 2026-09-14. Rebuild with
                                              install-llamacpp.ps1 + a model
                                              download if you want it back.
@@ -178,11 +193,12 @@ WHO WRITES THE CODE - pick an executor
                        it can, the free tier finishes the queue. Nothing is
                        billed either way.
 
-For -Executor auto, set the OpenRouter key once so the fallback actually
-exists, then open a NEW shell. The runner warns if it is missing and will
-simply stop early when Claude's window closes.
+For -Executor auto, set the Gemini key once so the fallback actually exists,
+then open a NEW shell. The runner warns if it is missing and will simply stop
+early when Claude's window closes.
 
-    [Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY","sk-or-...","User")
+    # free, no credit card: https://aistudio.google.com/apikey
+    [Environment]::SetEnvironmentVariable("GEMINI_API_KEY","<paste>","User")
 
 Then:
 
@@ -198,6 +214,11 @@ Then:
     # free tier only - no Claude usage consumed at all
     D:\ai\bin\night-run.ps1 -Root "D:\work\my-project" -Executor opencode
 
+    # try the whole workflow on a throwaway project first
+    Copy-Item -Recurse D:\ai\workflow\starter D:\work\starter-demo
+    cd D:\work\starter-demo; git init; git add -A; git commit -m init
+    D:\ai\bin\night-run.ps1 -Root "D:\work\starter-demo" -Executor opencode
+
 Options:
     -Executor auto|claude|opencode   who writes the code (default auto)
     -ClaudeModel sonnet|opus|haiku   model for the claude executor
@@ -207,7 +228,8 @@ Options:
                                      anything - only for a repo you can throw
                                      away. night-run runs the tests itself
                                      either way, so acceptEdits is enough.
-    -OpenCodeModel openrouter/...    provider/model for the opencode executor
+    -OpenCodeModel google/gemini-2.5-flash-lite
+                                     provider/model for the opencode executor
     -TestCmd "php artisan test"      override the auto-detected test command
     -TaskTimeoutMin 25               per-task hard timeout (default 20)
     -MaxRetries 0                    no retry on failure (default 1)
@@ -226,9 +248,10 @@ PREFLIGHT REFUSALS - all of these are deliberate:
     "night-run is already active" the lock file; see section 7
     "llama-server is not healthy" only when a local/ model is the ACTIVE
                                   executor. A claude run does not need it.
-    "OPENROUTER_API_KEY is not set" only when an openrouter/ model is the
-                                  ACTIVE executor; a warning when it is just
-                                  the fallback.
+    "No Gemini API key found"     only when a google/ model is the ACTIVE
+                                  executor; a warning when it is just the
+                                  fallback. Same for OPENROUTER_API_KEY with
+                                  an openrouter/ model.
 
 
 --------------------------------------------------------------------------------

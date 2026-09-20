@@ -19,8 +19,10 @@ USE IT
     # 3. see the queue without calling any model
     D:\ai\bin\night-run.ps1 -Root "D:\work\starter-demo" -DryRun
 
-    # 4. run it on the free executor
-    D:\ai\bin\night-run.ps1 -Root "D:\work\starter-demo" -Executor gemini
+    # 4. run it on the free executor (Gemini, 1000 requests/day)
+    #    needs GEMINI_API_KEY once - free, no card, from
+    #    https://aistudio.google.com/apikey
+    D:\ai\bin\night-run.ps1 -Root "D:\work\starter-demo" -Executor opencode
 
     # 5. see what happened
     git log --oneline
