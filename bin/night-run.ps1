@@ -15,12 +15,12 @@
                   strongest option. Bounded by your 5-hour / weekly usage
                   windows.
         opencode  opencode against any provider in opencode.json:
-                  google/gemini-2.5-flash-lite
+                  google/gemini-3.5-flash-lite
                                       DEFAULT FREE TIER. 1000 requests/day,
                                       15/min, 1M context, tool calling. Needs
                                       GEMINI_API_KEY - free from
                                       https://aistudio.google.com/apikey with
-                                      no credit card. google/gemini-2.5-flash
+                                      no credit card. google/gemini-3.5-flash
                                       is stronger but only 250/day.
                   openrouter/<model>  50 requests/day, or 1000/day once you
                                       have ever bought $10 of credit.
@@ -62,7 +62,7 @@ param(
     [string]$ClaudeModel      = "sonnet",
     [ValidateSet("acceptEdits","bypassPermissions")]
     [string]$ClaudePermission = "acceptEdits",
-    [string]$OpenCodeModel    = "google/gemini-2.5-flash-lite",
+    [string]$OpenCodeModel    = "google/gemini-3.5-flash-lite",
     [string]$TestCmd          = "",                 # auto-detected when empty
     [string]$ServerUrl        = "http://127.0.0.1:8080",
     [int]   $TaskTimeoutMin   = 20,
@@ -295,11 +295,17 @@ function Get-ExecutorInvocation {
             Label = "claude/$ClaudeModel"
         }
     }
+    # The prompt goes in on stdin here too, NOT as argv. Being a real .exe is
+    # not enough: PowerShell 5.1 does not escape double quotes inside a native
+    # argument, so a task line like
+    #     ... so 1234.5 becomes "1,234.50" and -9.005 becomes "-9.01"
+    # splits at the quotes and opencode's parser reads the "-9.01" fragment as
+    # an unknown flag, prints its help and exits 1. Every task carrying a
+    # quoted example - which is exactly how a task should be written - failed.
     return @{
         File  = $script:OpenCodeExe
-        Args  = @("run", "--auto", "--model", $OpenCodeModel,
-                  [IO.File]::ReadAllText($PromptFile))
-        Stdin = $null                    # a real .exe, so argv is safe here
+        Args  = @("run", "--auto", "--model", $OpenCodeModel)
+        Stdin = $PromptFile
         Label = "opencode/$OpenCodeModel"
     }
 }
@@ -439,7 +445,7 @@ try {
                                "  2. sign in and click 'Create API key'`n" +
                                "  3. run, then open a NEW shell:`n" +
                                "     [Environment]::SetEnvironmentVariable('GEMINI_API_KEY','<paste>','User')`n" +
-                               "gemini-2.5-flash-lite is then 1000 requests/day at no cost."
+                               "gemini-3.5-flash-lite is then 1000 requests/day at no cost."
                 }
             }
             elseif ($OpenCodeModel -like "openrouter/*") {

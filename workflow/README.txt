@@ -3,7 +3,7 @@
 ================================================================================
 
   Executor       Claude Code headless, on the existing subscription.
-  Fallback       Gemini via opencode - google/gemini-2.5-flash-lite, 1000
+  Fallback       Gemini via opencode - google/gemini-3.5-flash-lite, 1000
                  requests/day free. Needs GEMINI_API_KEY, free and with no
                  credit card from https://aistudio.google.com/apikey.
 
@@ -173,11 +173,11 @@ WHO WRITES THE CODE - pick an executor
                        weekly usage windows, not by tokens you buy.
 
   -Executor opencode   opencode against whatever is in opencode.json:
-                         google/gemini-2.5-flash-lite   THE FREE ONE.
+                         google/gemini-3.5-flash-lite   THE FREE ONE.
                                              1000 requests/day, 15/min, 1M
                                              context, tool calling. About 200
                                              tasks a day at ~5 calls each.
-                                             google/gemini-2.5-flash is
+                                             google/gemini-3.5-flash is
                                              stronger but only 250/day.
                                              Needs GEMINI_API_KEY.
                          openrouter/<model>  50 requests/day, or 1000/day
@@ -228,7 +228,7 @@ Options:
                                      anything - only for a repo you can throw
                                      away. night-run runs the tests itself
                                      either way, so acceptEdits is enough.
-    -OpenCodeModel google/gemini-2.5-flash-lite
+    -OpenCodeModel google/gemini-3.5-flash-lite
                                      provider/model for the opencode executor
     -TestCmd "php artisan test"      override the auto-detected test command
     -TaskTimeoutMin 25               per-task hard timeout (default 20)
