@@ -619,6 +619,7 @@ Pass -SkipBaseline to start anyway.
 
     # ----------------------------------------------------------- main loop ---
     $done = 0; $blocked = 0; $t0 = Get-Date
+    $script:Exhausted = $false
 
     while ($true) {
         $next = @(Get-QueuedTasks -Path $TasksFile) | Select-Object -First 1
@@ -672,15 +673,27 @@ Pass -SkipBaseline to start anyway.
             if ($rc -ne 0) {
                 Write-Log "  $($script:Active) exited $rc -> $outFile" "Yellow"
 
-                # Out of quota, not out of ability. Switch executors and give
-                # the new one a full retry budget - this attempt does not count
-                # against the task, because the task was never really tried.
-                if ($script:Chain.Count -gt 1 -and (Test-UsageLimited -LogPath $outFile)) {
-                    $spent = $script:Active
-                    $script:Chain  = @($script:Chain | Select-Object -Skip 1)
-                    $script:Active = $script:Chain[0]
-                    Write-Log "  USAGE LIMIT on $spent. Switching to $($script:Active) for the rest of the night." "Magenta"
-                    $maxAttempts   = $attempt + $MaxRetries + 1
+                # Out of quota, not out of ability. The task was never really
+                # tried, so it must not be judged - switch executors if there is
+                # another one, and otherwise STOP the night.
+                if (Test-UsageLimited -LogPath $outFile) {
+                    if ($script:Chain.Count -gt 1) {
+                        $spent = $script:Active
+                        $script:Chain  = @($script:Chain | Select-Object -Skip 1)
+                        $script:Active = $script:Chain[0]
+                        Write-Log "  USAGE LIMIT on $spent. Switching to $($script:Active) for the rest of the night." "Magenta"
+                        $maxAttempts   = $attempt + $MaxRetries + 1
+                        continue
+                    }
+
+                    # A quota wall is not a failed task. Without this the runner
+                    # spends the whole remaining queue on an API that answers
+                    # nothing, marking every one [!] - a queue of perfectly good
+                    # tasks destroyed by one exhausted key. Leave this task
+                    # QUEUED and stop, so the night resumes where it stalled.
+                    Write-Log "  USAGE LIMIT on $($script:Active) and no fallback executor left." "Magenta"
+                    $script:Exhausted = $true
+                    break
                 }
                 continue
             }
@@ -717,6 +730,18 @@ Pass -SkipBaseline to start anyway.
                        -WorkDir $Root -TimeoutSec 900 -OutFile $testOut
             if ($trc -eq 0) { $ok = $true; break }
             Write-Log "  tests failed (exit $trc) -> $testOut" "Yellow"
+        }
+
+        # A quota wall stops the night here. Roll the tree back to the last good
+        # commit and leave the queue line untouched: this task was never graded,
+        # so marking it either way would be a lie.
+        if ($script:Exhausted) {
+            if (-not $NoCommit) {
+                $null = Invoke-Git -Dir $Root -GitArgs @("reset", "--hard", $base)
+                $null = Invoke-Git -Dir $Root -GitArgs @("clean", "-fd")
+            }
+            Write-Log "  STOPPING - this task stays queued and runs first next time." "Magenta"
+            break
         }
 
         # --- record the result on the EXACT queue line -----------------------
@@ -787,6 +812,13 @@ Pass -SkipBaseline to start anyway.
     $mins = [int]((Get-Date) - $t0).TotalMinutes
     Write-Log ""
     Write-Log "=== DONE: $done passed, $blocked blocked, $mins min ===" "Cyan"
+    if ($script:Exhausted) {
+        $left = @(Get-QueuedTasks -Path $TasksFile).Count
+        Write-Log ""
+        Write-Log "STOPPED EARLY: $($script:Active) is out of quota. $left task(s) still queued." "Magenta"
+        Write-Log "They were NOT attempted and are NOT blocked. Re-run when the quota resets" "Magenta"
+        Write-Log "(the Gemini free tier resets daily at midnight Pacific) and it picks up here." "Magenta"
+    }
     Write-Log "In the morning, review blocked tasks:"
     Write-Log "  Select-String -Path '$TasksFile' -Pattern '\[!\]'"
 }
